@@ -114,12 +114,22 @@ async def transcription_ws(websocket: WebSocket) -> None:
             or websocket.query_params.get("client_session_id")
             or f"ws-{uuid.uuid4().hex}"
         )
+        from app.schemas.events import normalize_model_tier as _normalize_tier
+
+        # Billing tier resolves now so the tracker prices audio at the
+        # engine that transcribes it (pro audio bills QUOTA_PRO_MULTIPLIER).
+        # Untiered legacy sessions fall back to the deployment default.
+        billing_tier = _normalize_tier(
+            websocket.query_params.get("model_tier")
+        ) or settings.default_model_tier()
         try:
             quota = await begin_tracked_session(
                 state.quota_store,
                 user.id,
                 client_session_id,
                 min_start_seconds=settings.quota_min_start_seconds,
+                model_tier=billing_tier,
+                pro_multiplier=settings.quota_pro_multiplier,
             )
         except Exception as exc:
             if isinstance(exc, QuotaDenied):

@@ -42,6 +42,7 @@ in ``requirements.txt`` is the only dependency.
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from app.core.logging import get_logger
@@ -92,13 +93,31 @@ def to_soniox_audio_frame(audio_b64: str) -> str:
     return audio_b64
 
 
+SONIOX_ENDPOINT_TOKEN_RE = re.compile(r"</?\s*end\s*>", re.IGNORECASE)
+
+
+def _is_endpoint_token(text: str) -> bool:
+    """Whether a token is only a Soniox endpoint marker (`<end>` / `</end>`)."""
+    return SONIOX_ENDPOINT_TOKEN_RE.fullmatch(text.strip()) is not None
+
+
 def _original_text(tokens: list[dict]) -> str:
-    return "".join(
-        token.get("text", "")
-        for token in tokens
-        if token.get("is_final")
-        and token.get("translation_status", "none") in ("none", "original")
-    )
+    parts: list[str] = []
+    for token in tokens:
+        if not token.get("is_final"):
+            continue
+        if token.get("translation_status", "none") not in ("none", "original"):
+            continue
+        text = token.get("text", "")
+        if not isinstance(text, str) or not text:
+            continue
+        if _is_endpoint_token(text):
+            continue
+        parts.append(text)
+    # Endpoint detection finalizes the utterance with a special `<end>`
+    # token; strip any marker embedded in joined text so it never leaks
+    # downstream as a literal "</End>" caption.
+    return SONIOX_ENDPOINT_TOKEN_RE.sub("", "".join(parts))
 
 
 def map_soniox_event(
@@ -111,7 +130,9 @@ def map_soniox_event(
     here and surface once finalized. Soniox is transcription-only now,
     so ``transcription_mode`` is accepted for call compatibility and
     ignored: translated tokens (from a legacy translation session) are
-    never emitted. The ``finished`` response and empty token lists map
+    never emitted. The endpoint-detection ``<end>`` marker (any case or
+    ``</end>`` spelling) is stripped, so an endpoint-only response maps
+    to None. The ``finished`` response and empty token lists map
     to None (deltas only, no completed turns), the same downstream
     shape the OpenAI transcription tier produces.
     """

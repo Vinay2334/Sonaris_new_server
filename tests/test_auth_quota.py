@@ -137,6 +137,112 @@ def test_billed_seconds_rounds_up_partial_chunks():
     assert billed_seconds_for_bytes(0) == 0
 
 
+def test_billed_seconds_scales_pro_audio_by_multiplier():
+    # Pro-tier audio bills QUOTA_PRO_MULTIPLIER quota seconds per audio
+    # second; rounding happens once on the scaled total.
+    assert billed_seconds_for_bytes(48_000, 3.0) == 3
+    assert billed_seconds_for_bytes(9600, 3.0) == 1  # 0.2 s * 3 = 0.6 s
+    assert billed_seconds_for_bytes(48_001, 3.0) == 4
+    assert billed_seconds_for_bytes(0, 3.0) == 0
+    assert billed_seconds_for_bytes(48_000, 2.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_pro_session_bills_scaled_seconds():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(
+        store, USER_ID, "sess-pro", model_tier="pro", pro_multiplier=3.0
+    )
+    tracker.add_audio_bytes(48_000)  # 1 s of pro audio -> 3 quota seconds
+    tracker.note_transcript()
+    assert tracker.billed_seconds == 3
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 3
+    assert final.remaining_seconds == 2397
+
+
+@pytest.mark.asyncio
+async def test_base_session_bills_one_to_one():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(
+        store, USER_ID, "sess-base", model_tier="base"
+    )
+    tracker.add_audio_bytes(48_000)
+    tracker.note_transcript()
+    assert tracker.billed_seconds == 1
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 1
+
+
+@pytest.mark.asyncio
+async def test_mid_session_tier_switch_splits_billing():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(
+        store, USER_ID, "sess-switch", model_tier="base"
+    )
+    tracker.add_audio_bytes(48_000)  # 1 s base -> 1 quota second
+    tracker.set_model_tier("pro")
+    tracker.add_audio_bytes(48_000)  # 1 s pro -> 3 quota seconds
+    tracker.note_transcript()
+    assert tracker.billed_seconds == 4
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 4
+
+
+@pytest.mark.asyncio
+async def test_custom_pro_multiplier_scales_billing():
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(
+        store, USER_ID, "sess-mult", model_tier="pro", pro_multiplier=2.0
+    )
+    tracker.add_audio_bytes(48_000)
+    tracker.note_transcript()
+    assert tracker.billed_seconds == 2
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 2
+
+
+def test_quota_pro_multiplier_config_defaults_and_validates():
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    assert Settings(QUOTA_PRO_MULTIPLIER="3").quota_pro_multiplier == 3.0
+    assert Settings(QUOTA_PRO_MULTIPLIER="2.5").quota_pro_multiplier == 2.5
+    with pytest.raises(ValidationError):
+        Settings(QUOTA_PRO_MULTIPLIER="0")
+    with pytest.raises(ValidationError):
+        Settings(QUOTA_PRO_MULTIPLIER="-1")
+
+
+@pytest.mark.asyncio
+async def test_daily_reset_clears_yesterday_usage():
+    from datetime import datetime, timedelta, timezone
+
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-day1")
+    tracker.add_audio_bytes(48_000 * 10)
+    tracker.note_transcript()
+    await tracker.finish("closed")
+    assert (await store.get_quota(USER_ID)).used_seconds == 10
+    # Simulate UTC midnight passing: the stored period goes stale.
+    yesterday = (
+        datetime.now(timezone.utc).date() - timedelta(days=1)
+    ).isoformat()
+    store._profiles[USER_ID]["period"] = yesterday
+    snapshot = await store.get_quota(USER_ID)
+    assert snapshot.used_seconds == 0
+    assert snapshot.remaining_seconds == snapshot.limit_seconds
+    # A new session starts against the fresh day, not yesterday's usage.
+    tracker2 = await begin_tracked_session(store, USER_ID, "sess-day2")
+    assert tracker2.remaining_seconds == tracker2.snapshot.limit_seconds
+    assert tracker2.snapshot.period_start != yesterday
+
+
 # --- authorize / commit semantics ---------------------------------------------
 
 
@@ -144,13 +250,13 @@ def test_billed_seconds_rounds_up_partial_chunks():
 async def test_authorize_commit_updates_remaining():
     store = MemoryQuotaStore()
     tracker = await begin_tracked_session(store, USER_ID, "sess-1")
-    assert tracker.remaining_seconds == 6000
+    assert tracker.remaining_seconds == 2400
     tracker.add_audio_bytes(96_000)  # 2 s of audio
     tracker.note_transcript()
     final = await tracker.finish("closed")
     assert final is not None
     assert final.used_seconds == 2
-    assert final.remaining_seconds == 5998
+    assert final.remaining_seconds == 2398
     assert final.limit_seconds - final.used_seconds == final.remaining_seconds
 
 
@@ -221,7 +327,7 @@ async def test_checkpoint_commits_mid_session_and_finish_does_not_double_bill():
     final = await tracker.finish("closed")
     assert final is not None
     assert final.used_seconds == 3
-    assert final.remaining_seconds == 5997
+    assert final.remaining_seconds == 2397
 
 
 @pytest.mark.asyncio
@@ -355,9 +461,9 @@ def test_me_quota_returns_own_plan_and_usage():
     assert response.status_code == 200
     body = response.json()
     assert body["user_id"] == USER_ID
-    assert body["limit_seconds"] == 6000
+    assert body["limit_seconds"] == 2400
     assert body["used_seconds"] == 0
-    assert body["remaining_seconds"] == 6000
+    assert body["remaining_seconds"] == 2400
 
 
 def test_webrtc_offer_anonymous_token_rejected():
@@ -391,32 +497,64 @@ def test_websocket_without_token_closed_when_auth_on():
 
 # --- end-to-end over the WebSocket transport ------------------------------------
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _tolerant_websocket(client, url):
+    """websocket_connect that tolerates the portal teardown race.
+
+    starlette's WebSocketTestSession teardown can raise
+    concurrent.futures.CancelledError when the server already closed the
+    connection (the relay closes both sockets once the client goes away).
+    The server commits quota before that close, so the billing assertions
+    after the block stay the ground truth; body AssertionErrors propagate
+    normally.
+    """
+    from concurrent.futures import CancelledError
+
+    try:
+        with client.websocket_connect(url) as ws:
+            yield ws
+    except CancelledError:
+        pass
+
 
 def test_websocket_tracked_session_bills_audio_seconds():
     from tests.test_websocket import wait_for
 
-    client, fakes, app = make_client()
+    # Explicit base tier + pinned Soniox key: billing must not depend on
+    # the deployment's STT_PROVIDER default.
+    client, fakes, app = make_client(SONIOX_API_KEY="test-soniox-key")
     token = make_token()
-    with client.websocket_connect(f"/api/v1/transcription/ws?token={token}") as ws:
+    with _tolerant_websocket(
+        client, f"/api/v1/transcription/ws?token={token}&model_tier=base"
+    ) as ws:
         ready = json.loads(ws.receive_text())
         assert ready["type"] == "session.ready"
         opening = json.loads(ws.receive_text())
         assert opening["type"] == "quota.update"
-        assert opening["remaining_seconds"] == 6000
+        assert opening["remaining_seconds"] == 2400
         # 36_000 decoded bytes (~0.75 s of audio) bills a full second.
         ws.send_text(json.dumps({"type": "audio.append", "audio": "AQID" * 12000}))
         assert wait_for(lambda: len(fakes[0].sent) >= 1)
         fakes[0].inject(
             {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "transcript": "hello",
+                "tokens": [
+                    {
+                        "text": "hello",
+                        "is_final": True,
+                        "translation_status": "original",
+                    }
+                ],
+                "finished": False,
             }
         )
         deadline = time.time() + 5
         while time.time() < deadline:
             msg = json.loads(ws.receive_text())
-            if msg.get("type") == "transcript.completed":
-                assert msg["transcript"] == "hello"
+            if msg.get("type") == "transcript.delta":
+                assert msg["delta"] == "hello"
                 break
     store = app.state.quota_store
     import asyncio as _asyncio
@@ -425,7 +563,88 @@ def test_websocket_tracked_session_bills_audio_seconds():
         store.get_quota(USER_ID)
     )
     assert used.used_seconds == 1
-    assert used.remaining_seconds == 5999
+    assert used.remaining_seconds == 2399
+
+
+def test_websocket_tiered_billing_end_to_end():
+    # One session, two engines: base audio bills 1:1, audio after a
+    # mid-session switch to pro bills QUOTA_PRO_MULTIPLIER (3x). A single
+    # connection covers both stretches because the test harness only
+    # supports one full relay session per process (a second
+    # websocket_connect fails at the portal with CancelledError).
+    from tests.test_websocket import FakeUpstream, wait_for
+
+    client, fakes, app = make_client(SONIOX_API_KEY="test-soniox-key")
+    # Tier-aware factory: the base -> pro swap connects a fresh fake.
+    def tier_factory(tier=None):
+        fake = FakeUpstream()
+        fakes.append(fake)
+        return fake
+
+    app.state.upstream_factory = tier_factory
+    token = make_token()
+    with _tolerant_websocket(
+        client, f"/api/v1/transcription/ws?token={token}&model_tier=base"
+    ) as ws:
+        def next_of(*types, timeout=5.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                msg = json.loads(ws.receive_text())
+                if msg.get("type") in types:
+                    return msg
+            raise AssertionError(f"timed out waiting for {types}")
+
+        assert next_of("session.ready")["type"] == "session.ready"
+        opening = next_of("quota.update")
+        assert opening["remaining_seconds"] == 2400
+        # Base stretch: 48_000 decoded bytes (1 s of audio) bills 1 second.
+        ws.send_text(json.dumps({"type": "audio.append", "audio": "AQID" * 16000}))
+        assert wait_for(lambda: len(fakes) > 0 and len(fakes[0].sent) >= 1)
+        fakes[0].inject(
+            {
+                "tokens": [
+                    {
+                        "text": "hello",
+                        "is_final": True,
+                        "translation_status": "original",
+                    }
+                ],
+                "finished": False,
+            }
+        )
+        assert next_of("transcript.delta")["delta"] == "hello"
+        # Switch to pro mid-session: later audio bills 3x.
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "language-config",
+                    "mode": "transcription",
+                    "model_tier": "pro",
+                }
+            )
+        )
+        swapped = next_of("session.ready", "error")
+        assert swapped["type"] == "session.ready", swapped
+        # Pro stretch: 1 s of audio bills 3 quota seconds.
+        ws.send_text(json.dumps({"type": "audio.append", "audio": "AQID" * 16000}))
+        assert wait_for(lambda: len(fakes) > 1 and len(fakes[1].sent) >= 1)
+        fakes[1].inject(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "hello",
+            }
+        )
+        assert next_of("transcript.completed")["transcript"] == "hello"
+    store = app.state.quota_store
+    import asyncio as _asyncio
+
+    used = _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        store.get_quota(USER_ID)
+    )
+    # 1 s base + 1 s pro bills 1 + 3 = 4 quota seconds.
+    assert used.used_seconds == 4
+    assert used.remaining_seconds == 2396
+
 
 def test_webrtc_offer_auth_checked_before_api_key_config():
     # Auth runs first: no token -> 401 even when the API key is missing

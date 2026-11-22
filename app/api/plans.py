@@ -11,9 +11,7 @@ from ``DODO_PLAN_MAP`` (backend env): changing which Dodo product backs a
 plan needs a backend restart, everything else is DB-only.
 
 Reads go through the service_role key server-side, so RLS stays closed
-(no anon access to the table). Works pre-migration too: when the catalog
-columns (price_monthly_usd, features, display_order, is_featured) are
-absent, the endpoint falls back to the legacy column set with defaults.
+(no anon access to the table).
 """
 
 from __future__ import annotations
@@ -33,7 +31,6 @@ CATALOG_COLUMNS = (
     "id,name,quota_limit_seconds,price_label,tagline,"
     "price_monthly_usd,features,display_order,is_featured"
 )
-LEGACY_COLUMNS = "id,name,quota_limit_seconds,price_label,tagline"
 
 
 def _supabase_headers(settings: Settings) -> dict[str, str]:
@@ -46,11 +43,10 @@ def _supabase_headers(settings: Settings) -> dict[str, str]:
 
 
 async def fetch_plan_rows(settings: Settings) -> list[dict] | None:
-    """Raw ``plans`` rows, newest schema first with a legacy fallback.
+    """Raw ``plans`` rows for rendering.
 
     Returns None when Supabase cannot be reached at all (transient,
-    worth a retry). A 400 on the new column set means the catalog
-    migration has not been applied: retry with the legacy columns.
+    worth a retry).
     """
     base = settings.supabase_url.rstrip("/")
     headers = _supabase_headers(settings)
@@ -62,11 +58,6 @@ async def fetch_plan_rows(settings: Settings) -> list[dict] | None:
                 "/rest/v1/plans",
                 params={"select": CATALOG_COLUMNS, "order": "display_order"},
             )
-            if response.status_code == 400:
-                response = await client.get(
-                    "/rest/v1/plans",
-                    params={"select": LEGACY_COLUMNS, "order": "id"},
-                )
             if response.status_code >= 400:
                 log.warning(
                     "plans catalog read failed status=%s",

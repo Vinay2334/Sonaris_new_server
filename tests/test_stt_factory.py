@@ -345,6 +345,32 @@ def test_soniox_provisional_and_empty_responses_map_to_none():
     assert map_soniox_event({"tokens": [], "finished": True}) is None
 
 
+def test_soniox_endpoint_token_maps_to_none():
+    # Endpoint detection finalizes each utterance with a special token;
+    # it must never leak downstream as a literal caption.
+    for marker in ("<end>", "</end>", "</End>", "<END>", "  <end>  "):
+        event = {
+            "tokens": [
+                {"text": marker, "is_final": True, "translation_status": "original"}
+            ],
+            "finished": False,
+        }
+        assert map_soniox_event(event) is None
+
+
+def test_soniox_endpoint_token_stripped_from_speech():
+    event = {
+        "tokens": [
+            {"text": "Hello ", "is_final": True, "translation_status": "original"},
+            {"text": "<end>", "is_final": True, "translation_status": "original"},
+        ],
+        "finished": False,
+    }
+    mapped = map_soniox_event(event)
+    assert isinstance(mapped, TranscriptDeltaEvent)
+    assert mapped.delta == "Hello "
+
+
 def test_soniox_error_raises_upstream_error():
     with pytest.raises(UpstreamError):
         map_soniox_event({"type": "error", "error": {"code": "rate_limited"}})

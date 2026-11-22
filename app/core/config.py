@@ -156,6 +156,14 @@ class Settings(BaseSettings):
     quota_commit_seconds: float = Field(
         default=15.0, alias="QUOTA_COMMIT_SECONDS"
     )
+    # Pro-tier quota multiplier: each second of audio transcribed with the
+    # pro engine (OpenAI) bills this many quota seconds, while base-tier
+    # audio (Soniox) bills 1:1. Tune as model costs change; applies to
+    # sessions started after the change (running sessions keep the value
+    # their tracker captured at authorize time).
+    quota_pro_multiplier: float = Field(
+        default=3.0, alias="QUOTA_PRO_MULTIPLIER"
+    )
 
     # --- Static website access (browser fetches of the JSON API) ---
     # Origins allowed to call the API from a browser (the static pricing
@@ -242,7 +250,10 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "session_idle_timeout_seconds", "quota_refresh_seconds", "quota_commit_seconds"
+        "session_idle_timeout_seconds",
+        "quota_refresh_seconds",
+        "quota_commit_seconds",
+        "quota_pro_multiplier",
     )
     @classmethod
     def _positive_float(cls, value: float) -> float:

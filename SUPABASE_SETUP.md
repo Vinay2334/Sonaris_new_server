@@ -25,11 +25,11 @@ It creates:
 
 | Object | Purpose |
 |---|---|
-| `plans` | Plan catalog (`free` = 6000 s / 100 min default). Edit limits here; the backend reads them live. |
-| `profiles` | One row per user (`user_id` → `auth.users.id`), plan + used seconds. Auto-created on signup via the `handle_new_user` trigger. |
+| `plans` | Plan catalog (`free` = 2400 s / 40 min per day default). Edit limits here; the backend reads them live. |
+| `profiles` | One row per user (`user_id` → `auth.users.id`), plan + used seconds for the current UTC day (`quota_period_start`). Auto-created on signup via the `handle_new_user` trigger. |
 | `subtitle_sessions` | One row per logical session, keyed by idempotency key `client_session_id`. Exactly-once billing. |
 | RLS policies | Users read only their own rows. **No** write policy for plan/quota/usage — only `service_role` (the backend) changes them. |
-| `authorize_session` / `commit_session_usage` | Atomic RPCs: pre-start quota check + idempotent usage commit (row locks serialize concurrent sessions). |
+| `authorize_session` / `commit_session_usage` / `checkpoint_session_usage` / `get_quota_snapshot` | Atomic RPCs: pre-start quota check + idempotent usage commit (row locks serialize concurrent sessions). Every call resets a stale `quota_period_start` to today first, so quotas are daily with no cron job. |
 
 Verify: **Table Editor** should show `plans` with the `free` row.
 
@@ -89,12 +89,17 @@ usage; without it they keep the previous open local-dev behavior.
 ## 6. Testing plan/quota changes from the dashboard
 
 - **Change a user's plan**: Table Editor → `profiles` → set `plan_id`
-  (e.g. add a `pro` row in `plans` first). Takes effect on the next
-  session start and on the next menu open (the menu re-reads quota when
-  opened, and the backend pushes live `quota.update` events while running).
-- **Top up / reset usage**: edit `profiles.quota_used_seconds`.
+  (`free` / `starter` / `pro` / `studio` all exist after the daily-plans
+  migration). Takes effect on the next session start and on the next menu
+  open (the menu re-reads quota when opened, and the backend pushes live
+  `quota.update` events while running).
+- **Top up / reset usage**: edit `profiles.quota_used_seconds` (today's
+  usage; it resets to 0 automatically at UTC midnight). To simulate a new
+  day, set `profiles.quota_period_start` to yesterday — the next read,
+  authorize, checkpoint, or commit resets `quota_used_seconds` to 0.
 - **Audit billing**: `subtitle_sessions` shows per-session billed seconds
-  and status (`completed` vs `failed` — failed/unprocessed sessions bill 0).
+  (pro-engine seconds already scaled by `QUOTA_PRO_MULTIPLIER`) and status
+  (`completed` vs `failed` — failed/unprocessed sessions bill 0).
 - Never edit `quota` from the extension: RLS blocks it; the menu is
   display-only.
 
@@ -118,6 +123,14 @@ usage; without it they keep the previous open local-dev behavior.
   exhausted quota gets 402/`quota_exceeded`.
 - Billing counts only audio bytes the relay kept (validated, under the
   rate limit), converted server-side (`48_000` B = 1 s, rounded up).
+  Base-tier audio (Soniox) bills 1:1; pro-tier audio (OpenAI
+  gpt-live-transcribe) bills `QUOTA_PRO_MULTIPLIER` quota seconds per
+  audio second (default 3, tunable via the backend `.env` without a
+  migration — running sessions keep the value captured at start).
+- Quotas are daily: usage counts the current UTC day only and resets at
+  UTC midnight automatically. Plan limits are therefore per day
+  (`free` 2,400 s · `starter` 10,800 s · `pro` 32,400 s · `studio`
+  43,200 s).
 - `client_session_id` makes reconnects/retries idempotent; concurrent
   sessions serialize on the profile row; a running session is cut off when
   remaining quota hits zero.
@@ -128,9 +141,16 @@ usage; without it they keep the previous open local-dev behavior.
 
 Billing is live in the backend; no quota-flow changes were needed:
 
-- `supabase/migrations/20261116000000_billing_plans.sql` adds the `pro`
-  (60,000 s) and `studio` (240,000 s) rows `website/index.html` sells.
-  Apply it with `supabase db push` (or paste it into the SQL editor).
+- `supabase/migrations/20261121000000_daily_plans.sql` enforces the four
+  daily plans the pricing site sells (`free` 2,400 s · `starter` 10,800 s
+  · `pro` 32,400 s · `studio` 43,200 s, with display prices, features,
+  order, and highlight). It upserts unconditionally, so re-running
+  repairs any hand-edited limits. Apply it with `supabase db push` (or
+  paste it into the SQL editor), after
+  `20261120000000_daily_quota.sql` (daily reset mechanics). The older
+  `20261116000000_billing_plans.sql` / `20261118000000_plan_catalog.sql`
+  seeds are superseded by these two — keep them for history, but the
+  daily migrations are what converge every project.
 - `POST /api/v1/billing/dodo/webhook` (`app/api/billing.py`) verifies the
   Standard Webhooks signature (`DODO_WEBHOOK_SECRET`), maps the Dodo
   product to a plan (`DODO_PLAN_MAP`, e.g. `prod_abc=pro`), and writes

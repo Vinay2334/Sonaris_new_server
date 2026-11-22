@@ -2,9 +2,15 @@
 
 Billing rule (server-side only, never trusts client-supplied numbers):
 every validated inbound audio byte counts ``1 / PCM_BYTES_PER_SECOND`` of
-a second; the commit rounds up to whole seconds. Paused/muted stretches
-send no audio, so they bill nothing; an idle-but-open session with no
-audio bills nothing.
+a second at the session's model tier; the commit rounds up to whole
+seconds. Base-tier audio (Soniox) bills 1:1; pro-tier audio (OpenAI)
+bills ``QUOTA_PRO_MULTIPLIER`` (default 3) quota seconds per audio
+second. Paused/muted stretches send no audio, so they bill nothing; an
+idle-but-open session with no audio bills nothing.
+
+Quotas are daily: ``used`` counts this UTC day only and resets to 0 at
+UTC midnight (profiles carry ``quota_period_start``; every read/write
+path resets a stale period before enforcing).
 
 Safety properties:
 - ``authorize`` runs before a session starts and refuses when no quota
@@ -36,6 +42,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 
@@ -48,16 +55,31 @@ log = get_logger(__name__)
 PCM_BYTES_PER_SECOND = 48_000
 
 # Quota for users when the backend has no Supabase project configured
-# (local dev / tests). Matches the SQL default plan (100 minutes).
+# (local dev / tests). Matches the SQL `free` plan (40 daily minutes).
 MEMORY_DEFAULT_PLAN = "Free"
-MEMORY_DEFAULT_LIMIT_SECONDS = 6000
+MEMORY_DEFAULT_LIMIT_SECONDS = 2400
+
+# Quota multiplier applied to pro-tier audio when no explicit value is
+# passed (mirrors Settings.quota_pro_multiplier's default).
+DEFAULT_PRO_MULTIPLIER = 3.0
 
 
-def billed_seconds_for_bytes(num_bytes: int) -> int:
-    """Whole seconds billed for validated audio bytes (rounds up)."""
+def utc_today_iso() -> str:
+    """Current UTC calendar day (``YYYY-MM-DD``): the daily quota period."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def billed_seconds_for_bytes(num_bytes: float, multiplier: float = 1.0) -> int:
+    """Whole seconds billed for validated audio bytes (rounds up).
+
+    ``multiplier`` scales the audio time before rounding: base-tier audio
+    bills 1:1, pro-tier audio bills ``QUOTA_PRO_MULTIPLIER`` quota seconds
+    per audio second. Rounding happens once on the scaled total, so a
+    short pro burst bills ``ceil(bytes * multiplier / 48_000)``.
+    """
     if num_bytes <= 0:
         return 0
-    return int(math.ceil(num_bytes / PCM_BYTES_PER_SECOND))
+    return int(math.ceil(num_bytes * max(multiplier, 0.0) / PCM_BYTES_PER_SECOND))
 
 
 @dataclass(frozen=True)
@@ -66,6 +88,7 @@ class QuotaSnapshot:
     plan: str
     used_seconds: int
     limit_seconds: int
+    period_start: str = ""
 
     @property
     def remaining_seconds(self) -> int:
@@ -78,6 +101,7 @@ class QuotaSnapshot:
             "used_seconds": self.used_seconds,
             "limit_seconds": self.limit_seconds,
             "remaining_seconds": self.remaining_seconds,
+            "period_start": self.period_start,
         }
 
 
@@ -122,7 +146,12 @@ class QuotaStore:
 
 
 class MemoryQuotaStore(QuotaStore):
-    """In-process store: local dev fallback and hermetic tests."""
+    """In-process store: local dev fallback and hermetic tests.
+
+    Daily quotas: each profile carries the UTC day its ``used`` counts
+    for. Any access in a new day resets ``used`` to 0 first, so usage
+    never leaks across the UTC-midnight boundary.
+    """
 
     def __init__(self, default_limit_seconds: int = MEMORY_DEFAULT_LIMIT_SECONDS) -> None:
         self._lock = asyncio.Lock()
@@ -134,21 +163,41 @@ class MemoryQuotaStore(QuotaStore):
         """Dashboard equivalent for tests: change a user's plan + limit."""
         profile = self._profiles.setdefault(
             user_id,
-            {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
+            {
+                "plan": MEMORY_DEFAULT_PLAN,
+                "limit": self._default_limit,
+                "used": 0,
+                "period": utc_today_iso(),
+            },
         )
         profile["plan"] = plan
         profile["limit"] = limit_seconds
 
-    def _snapshot(self, user_id: str) -> QuotaSnapshot:
+    def _profile(self, user_id: str) -> dict:
+        """Profile row, resetting a stale daily period to zero usage."""
         profile = self._profiles.setdefault(
             user_id,
-            {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
+            {
+                "plan": MEMORY_DEFAULT_PLAN,
+                "limit": self._default_limit,
+                "used": 0,
+                "period": utc_today_iso(),
+            },
         )
+        today = utc_today_iso()
+        if profile.get("period") != today:
+            profile["used"] = 0
+            profile["period"] = today
+        return profile
+
+    def _snapshot(self, user_id: str) -> QuotaSnapshot:
+        profile = self._profile(user_id)
         return QuotaSnapshot(
             user_id=user_id,
             plan=profile["plan"],
             used_seconds=profile["used"],
             limit_seconds=profile["limit"],
+            period_start=profile.get("period", ""),
         )
 
     async def get_quota(self, user_id: str) -> QuotaSnapshot:
@@ -184,10 +233,7 @@ class MemoryQuotaStore(QuotaStore):
             delta = max(billed - session["billed"], 0)
             if delta:
                 session["billed"] = billed
-                profile = self._profiles.setdefault(
-                    session["user_id"],
-                    {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
-                )
+                profile = self._profile(session["user_id"])
                 profile["used"] += delta
             return self._snapshot(session["user_id"])
 
@@ -207,10 +253,7 @@ class MemoryQuotaStore(QuotaStore):
             delta = final_billed - session["billed"]
             session["status"] = status
             session["billed"] = final_billed
-            profile = self._profiles.setdefault(
-                session["user_id"],
-                {"plan": MEMORY_DEFAULT_PLAN, "limit": self._default_limit, "used": 0},
-            )
+            profile = self._profile(session["user_id"])
             profile["used"] = max(profile["used"] + delta, 0)
             return self._snapshot(session["user_id"])
 
@@ -218,10 +261,10 @@ class MemoryQuotaStore(QuotaStore):
 class SupabaseQuotaStore(QuotaStore):
     """Postgres-backed store via Supabase REST (service role key).
 
-    Prefers the atomic ``authorize_session`` / ``commit_session_usage``
-    RPCs from the migration; falls back to plain REST reads/writes when
-    the RPCs are absent so a partially applied migration still serves
-    quota reads.
+    All quota reads/writes go through the atomic daily-quota RPCs
+    (``authorize_session`` / ``get_quota_snapshot`` /
+    ``checkpoint_session_usage`` / ``commit_session_usage``); a missing
+    or failing RPC raises instead of silently serving stale numbers.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -233,7 +276,6 @@ class SupabaseQuotaStore(QuotaStore):
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
-        self._min_start = max(settings.quota_min_start_seconds, 1)
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -257,43 +299,6 @@ class SupabaseQuotaStore(QuotaStore):
         except ValueError:
             return None
 
-    async def _rest_profile(self, user_id: str) -> QuotaSnapshot:
-        async with self._client() as client:
-            profile_resp = await client.get(
-                "/rest/v1/profiles",
-                params={
-                    "user_id": f"eq.{user_id}",
-                    "select": "quota_used_seconds,plan_id",
-                },
-            )
-            if profile_resp.status_code >= 400:
-                raise RuntimeError(f"profile read failed: {profile_resp.status_code}")
-            rows = profile_resp.json()
-            if not rows:
-                return QuotaSnapshot(
-                    user_id=user_id, plan="Free", used_seconds=0, limit_seconds=0
-                )
-            row = rows[0]
-            plan_resp = await client.get(
-                "/rest/v1/plans",
-                params={
-                    "id": f"eq.{row.get('plan_id', 'free')}",
-                    "select": "name,quota_limit_seconds",
-                },
-            )
-            name, limit = "Free", 0
-            if plan_resp.status_code < 400:
-                plans = plan_resp.json()
-                if plans:
-                    name = plans[0].get("name", "Free")
-                    limit = int(plans[0].get("quota_limit_seconds", 0) or 0)
-            return QuotaSnapshot(
-                user_id=user_id,
-                plan=name,
-                used_seconds=int(row.get("quota_used_seconds", 0) or 0),
-                limit_seconds=limit,
-            )
-
     @staticmethod
     def _snapshot_from_rpc(user_id: str, data: dict) -> QuotaSnapshot:
         return QuotaSnapshot(
@@ -301,10 +306,14 @@ class SupabaseQuotaStore(QuotaStore):
             plan=str(data.get("plan", "Free")),
             used_seconds=int(data.get("used_seconds", 0) or 0),
             limit_seconds=int(data.get("limit_seconds", 0) or 0),
+            period_start=str(data.get("period_start", "") or ""),
         )
 
     async def get_quota(self, user_id: str) -> QuotaSnapshot:
-        return await self._rest_profile(user_id)
+        data = await self._rpc("get_quota_snapshot", {"p_user_id": user_id})
+        if data is None or data.get("used_seconds") is None:
+            raise RuntimeError("quota snapshot RPC unavailable")
+        return self._snapshot_from_rpc(user_id, data)
 
     async def authorize(
         self, user_id: str, client_session_id: str, min_start_seconds: int = 1
@@ -313,28 +322,11 @@ class SupabaseQuotaStore(QuotaStore):
             "authorize_session",
             {"p_user_id": user_id, "p_client_session_id": client_session_id},
         )
-        if data is not None:
-            snapshot = self._snapshot_from_rpc(user_id, data)
-            if not data.get("allowed", False):
-                raise QuotaDenied(snapshot)
-            return snapshot
-        # Fallback without RPCs: read + plain insert (less atomic, but
-        # keeps quota reads working on a partially applied migration).
-        snapshot = await self._rest_profile(user_id)
-        if snapshot.remaining_seconds < max(min_start_seconds, self._min_start):
+        if data is None:
+            raise RuntimeError("quota authorize RPC unavailable")
+        snapshot = self._snapshot_from_rpc(user_id, data)
+        if not data.get("allowed", False):
             raise QuotaDenied(snapshot)
-        try:
-            async with self._client() as client:
-                await client.post(
-                    "/rest/v1/subtitle_sessions",
-                    json={
-                        "user_id": user_id,
-                        "client_session_id": client_session_id,
-                        "status": "active",
-                    },
-                )
-        except httpx.HTTPError as exc:
-            log.warning("session insert failed type=%s", type(exc).__name__)
         return snapshot
 
     async def checkpoint(
@@ -347,11 +339,8 @@ class SupabaseQuotaStore(QuotaStore):
                 "p_billed_seconds": max(int(billed_seconds or 0), 0),
             },
         )
-        # None covers a DB without the checkpoint migration yet: the
-        # tracker keeps the seconds uncommitted and retries next interval
-        # (its effective-remainder check still bounds this session).
         if data is None:
-            return None
+            raise RuntimeError("quota checkpoint RPC unavailable")
         used = data.get("used_seconds")
         if used is None:
             return None
@@ -374,7 +363,7 @@ class SupabaseQuotaStore(QuotaStore):
             },
         )
         if data is None:
-            return None
+            raise RuntimeError("quota commit RPC unavailable")
         used = data.get("used_seconds")
         if used is None:
             return None
@@ -399,13 +388,23 @@ class SessionQuotaTracker:
     Only audio bytes the relay actually kept (post-validation,
     post-rate-limit) are added. ``finish`` converts to whole seconds and
     commits exactly once; unknown sessions commit nothing.
+
+    Tier-weighted billing: bytes are bucketed by the tier in effect when
+    they arrived. Base-tier audio bills 1:1; pro-tier audio bills
+    ``pro_multiplier`` quota seconds per audio second. A mid-session tier
+    swap (``set_model_tier``) routes later bytes to the other bucket, so
+    each stretch bills at the engine that actually transcribed it.
     """
 
     store: QuotaStore
     user_id: str
     client_session_id: str
     snapshot: QuotaSnapshot
+    model_tier: str | None = None
+    pro_multiplier: float = DEFAULT_PRO_MULTIPLIER
     audio_bytes: int = 0
+    base_audio_bytes: int = 0
+    pro_audio_bytes: int = 0
     transcripts_emitted: int = 0
     refresh_interval: float = 5.0
     checkpoint_interval: float = 15.0
@@ -416,7 +415,10 @@ class SessionQuotaTracker:
 
     @property
     def billed_seconds(self) -> int:
-        return billed_seconds_for_bytes(self.audio_bytes)
+        weighted = self.base_audio_bytes + self.pro_audio_bytes * max(
+            self.pro_multiplier, 0.0
+        )
+        return billed_seconds_for_bytes(weighted)
 
     @property
     def remaining_seconds(self) -> int:
@@ -441,9 +443,24 @@ class SessionQuotaTracker:
         """
         return max(self.snapshot.remaining_seconds - self.uncommitted_seconds, 0)
 
+    def set_model_tier(self, model_tier: str | None) -> None:
+        """Route subsequently added audio to a tier's billing bucket."""
+        tier = (model_tier or "").strip().lower()
+        self.model_tier = tier if tier in ("base", "pro") else None
+
+    def set_pro_multiplier(self, multiplier: float) -> None:
+        """Update the pro-tier scaling for subsequently billed audio."""
+        if multiplier > 0:
+            self.pro_multiplier = multiplier
+
     def add_audio_bytes(self, num_bytes: int) -> None:
-        if num_bytes > 0:
-            self.audio_bytes += num_bytes
+        if num_bytes <= 0:
+            return
+        self.audio_bytes += num_bytes
+        if (self.model_tier or "").strip().lower() == "pro":
+            self.pro_audio_bytes += num_bytes
+        else:
+            self.base_audio_bytes += num_bytes
 
     def note_transcript(self) -> None:
         self.transcripts_emitted += 1
@@ -545,12 +562,13 @@ class SessionQuotaTracker:
             self._committed_seconds = billed
             self.snapshot = final
         log.info(
-            "quota session billed user=%s billed=%ds transcripts=%d status=%s reason=%s",
+            "quota session billed user=%s billed=%ds transcripts=%d status=%s reason=%s tier=%s",
             self.user_id,
             billed,
             self.transcripts_emitted,
             status,
             reason,
+            self.model_tier or "base",
         )
         return final
 
@@ -561,11 +579,20 @@ async def begin_tracked_session(
     client_session_id: str,
     *,
     min_start_seconds: int = 1,
+    model_tier: str | None = None,
+    pro_multiplier: float = DEFAULT_PRO_MULTIPLIER,
 ) -> SessionQuotaTracker:
-    """Authorize + build a tracker. Raises QuotaDenied when not allowed."""
+    """Authorize + build a tracker. Raises QuotaDenied when not allowed.
+
+    ``model_tier`` selects the billing bucket from the first byte
+    (``"pro"`` scales by ``pro_multiplier``, anything else bills 1:1).
+    """
     snapshot = await store.authorize(
         user_id, client_session_id, min_start_seconds=min_start_seconds
     )
-    return SessionQuotaTracker(
+    tracker = SessionQuotaTracker(
         store=store, user_id=user_id, client_session_id=client_session_id, snapshot=snapshot
     )
+    tracker.set_model_tier(model_tier)
+    tracker.set_pro_multiplier(pro_multiplier)
+    return tracker

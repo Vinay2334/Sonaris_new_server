@@ -95,6 +95,55 @@ def test_lists_plans_ordered_with_dodo_products(monkeypatch):
     assert plans[0]["dodo_product_id"] is None
 
 
+def test_daily_plan_catalog_orders_four_plans_with_products(monkeypatch):
+    rows = [
+        {
+            "id": "studio", "name": "Studio", "quota_limit_seconds": 43200,
+            "price_label": "$50 / month", "tagline": "For all-day power users",
+            "price_monthly_usd": 50, "features": [], "display_order": 3,
+            "is_featured": False,
+        },
+        {
+            "id": "pro", "name": "Pro", "quota_limit_seconds": 32400,
+            "price_label": "$27 / month", "tagline": "For daily meetings",
+            "price_monthly_usd": 27, "features": [], "display_order": 2,
+            "is_featured": True,
+        },
+        {
+            "id": "starter", "name": "Starter", "quota_limit_seconds": 10800,
+            "price_label": "$10 / month", "tagline": "For casual viewing",
+            "price_monthly_usd": 10, "features": [], "display_order": 1,
+            "is_featured": False,
+        },
+        {
+            "id": "free", "name": "Free", "quota_limit_seconds": 2400,
+            "price_label": "$0 / month", "tagline": "For trying Captify",
+            "price_monthly_usd": 0, "features": [], "display_order": 0,
+            "is_featured": False,
+        },
+    ]
+
+    async def fake_fetch(settings):
+        return rows
+
+    monkeypatch.setattr(plans_api, "fetch_plan_rows", fake_fetch)
+    settings = make_settings(
+        DODO_PLAN_MAP="prod_starter=starter,prod_pro=pro,prod_studio=studio"
+    )
+    client = TestClient(create_app(settings))
+    resp = client.get("/api/v1/plans")
+    assert resp.status_code == 200
+    plans = resp.json()["plans"]
+    assert [p["id"] for p in plans] == ["free", "starter", "pro", "studio"]
+    assert [p["minutes"] for p in plans] == [40, 180, 540, 720]
+    by_id = {p["id"]: p for p in plans}
+    assert by_id["pro"]["is_featured"] is True
+    assert by_id["free"]["dodo_product_id"] is None
+    assert by_id["starter"]["dodo_product_id"] == "prod_starter"
+    assert by_id["pro"]["dodo_product_id"] == "prod_pro"
+    assert by_id["studio"]["dodo_product_id"] == "prod_studio"
+
+
 def test_legacy_rows_degrade_to_defaults(monkeypatch):
     client = make_client(
         monkeypatch,

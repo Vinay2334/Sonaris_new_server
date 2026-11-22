@@ -151,6 +151,8 @@ async def webrtc_offer(payload: OfferRequest, request: Request):
                 user.id,
                 client_session_id,
                 min_start_seconds=settings.quota_min_start_seconds,
+                model_tier=model_tier or settings.default_model_tier(),
+                pro_multiplier=settings.quota_pro_multiplier,
             )
         except QuotaDenied as exc:
             log.info("webrtc offer rejected: quota exhausted user=%s", user.id)

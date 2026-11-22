@@ -132,6 +132,11 @@ class WebRTCRelaySession:
         self._model_tier = normalize_model_tier(model_tier)
         self._workflow = STTWorkflowFactory.get_workflow(settings, self._model_tier)
         self._is_tiered = self._workflow.tier is not None
+        if quota is not None:
+            # Billing follows the engine that transcribes: untiered
+            # legacy sessions fall back to the deployment default tier.
+            quota.set_model_tier(self._model_tier or settings.default_model_tier())
+            quota.set_pro_multiplier(settings.quota_pro_multiplier)
         self._subtitle = subtitle or SubtitleFactory.get_translator(settings)
         self._subtitle_target_language = settings.translation_target_language
         self._subtitle_source = settings.translation_source_language or None
@@ -500,6 +505,9 @@ class WebRTCRelaySession:
         self._workflow = STTWorkflowFactory.get_workflow(self._settings, tier)
         self._model_tier = normalize_model_tier(tier)
         self._is_tiered = True
+        if self._quota is not None:
+            # Later audio bills at the new engine's rate.
+            self._quota.set_model_tier(tier)
         self._transcription_mode = True
         self._transcription_languages = []
         try:
