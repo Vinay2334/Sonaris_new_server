@@ -28,7 +28,7 @@ from app.services.quota import (
     billed_seconds_for_bytes,
 )
 
-TEST_SECRET = "test-jwt-secret-for-captify-quota-tests"
+TEST_SECRET = "test-jwt-secret-for-sonaris-quota-tests"
 USER_ID = "11111111-2222-3333-4444-555555555555"
 
 
@@ -43,7 +43,7 @@ def make_token(
     if anonymous:
         claims["is_anonymous"] = True
     else:
-        claims["email"] = "user@captify.local"
+        claims["email"] = "user@sonaris.local"
     return jwt.encode(claims, secret, algorithm="HS256")
 
 
@@ -82,7 +82,7 @@ def make_client(**overrides):
 def test_valid_hs256_token_verifies():
     user = verify_supabase_token(make_token(), make_settings())
     assert user.id == USER_ID
-    assert user.email == "user@captify.local"
+    assert user.email == "user@sonaris.local"
 
 
 def test_wrong_secret_rejected():

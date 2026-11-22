@@ -1,4 +1,4 @@
-# Captify Translation Backend
+# Sonaris Translation Backend
 
 FastAPI backend relaying tab audio to OpenAI Realtime translation
 (`gpt-realtime-translate`, or transcription with `gpt-realtime-transcribe`).

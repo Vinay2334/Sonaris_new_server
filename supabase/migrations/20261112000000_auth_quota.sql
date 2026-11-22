@@ -1,4 +1,4 @@
--- Captify authentication + quota management.
+-- Sonaris authentication + quota management.
 --
 -- SOURCE OF TRUTH for `supabase db push` (timestamped name is what the
 -- Supabase CLI expects). Apply once per project BEFORE starting the
@@ -34,7 +34,7 @@ create table if not exists public.plans (
 -- Default plan assigned to every newly registered user.
 -- 6000 seconds = 100 minutes (matches the extension's quota display).
 insert into public.plans (id, name, quota_limit_seconds, price_label, tagline)
-values ('free', 'Free', 6000, '$0 / month', 'For trying Captify')
+values ('free', 'Free', 6000, '$0 / month', 'For trying Sonaris')
 on conflict (id) do nothing;
 
 -- -------------------------------------------------------------- profiles ---

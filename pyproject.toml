@@ -1,5 +1,5 @@
 [project]
-name = "captify-server"
+name = "sonaris-server"
 version = "0.1.0"
 description = "FastAPI WebSocket backend relaying tab audio to OpenAI Realtime translation"
 readme = "README.md"

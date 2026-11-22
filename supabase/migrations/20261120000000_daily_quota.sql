@@ -1,4 +1,4 @@
--- Captify daily quota reset.
+-- Sonaris daily quota reset.
 --
 -- SOURCE OF TRUTH for `supabase db push` (apply after
 -- 20261119000000_quota_checkpoint.sql). Additive only.

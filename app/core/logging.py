@@ -36,7 +36,7 @@ def configure_logging(level: str = "INFO") -> logging.Logger:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     _configured = True
-    return logging.getLogger("captify")
+    return logging.getLogger("sonaris")
 
 
 def get_logger(name: str) -> logging.Logger:

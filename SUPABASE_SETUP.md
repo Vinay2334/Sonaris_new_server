@@ -1,7 +1,7 @@
 # Supabase Auth + Quota Setup
 
 This guide wires user authentication (Google OAuth + email) and subtitle
-quota management into Captify. Estimated: 15–20 minutes in the Supabase
+quota management into Sonaris. Estimated: 15–20 minutes in the Supabase
 dashboard, no code changes required.
 
 ## 1. Create the Supabase project
@@ -35,7 +35,7 @@ Verify: **Table Editor** should show `plans` with the `free` row.
 
 ## 3. Configure the backend
 
-Add to `Captify_new_server/.env` (see `.env.example`):
+Add to `server_new/.env` (see `.env.example`):
 
 ```env
 SUPABASE_URL=https://YOUR-PROJECT.supabase.co
@@ -54,7 +54,7 @@ usage; without it they keep the previous open local-dev behavior.
 
 ## 4. Configure the extension
 
-1. Edit `Captify_rtc/src/caption-overlay/lib/supabase-config.js`:
+1. Edit `extensionRTC/src/caption-overlay/lib/supabase-config.js`:
    `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `BACKEND_BASE_URL`
    (must match where uvicorn listens).
 2. Rebuild: `npm run build` (output in `dist/`), then reload the

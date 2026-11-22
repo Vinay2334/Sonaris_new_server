@@ -1,4 +1,4 @@
--- Captify plan catalog for the pricing site.
+-- Sonaris plan catalog for the pricing site.
 --
 -- SOURCE OF TRUTH for `supabase db push` (apply after
 -- 20261116000000_billing_plans.sql). Additive only.

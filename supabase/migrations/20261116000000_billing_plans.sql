@@ -1,4 +1,4 @@
--- Captify paid plans for Dodo Payments checkout.
+-- Sonaris paid plans for Dodo Payments checkout.
 --
 -- SOURCE OF TRUTH for `supabase db push` (apply after
 -- 20261112000000_auth_quota.sql). Additive only: inserts the `pro` and

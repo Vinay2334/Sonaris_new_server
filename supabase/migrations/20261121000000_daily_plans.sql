@@ -1,4 +1,4 @@
--- Captify daily plan catalog: Free / Starter / Pro / Studio.
+-- Sonaris daily plan catalog: Free / Starter / Pro / Studio.
 --
 -- SOURCE OF TRUTH for `supabase db push` (apply after
 -- 20261120000000_daily_quota.sql). Enforces the daily plans: each row is
@@ -22,7 +22,7 @@ insert into public.plans (
 )
 values
   (
-    'free', 'Free', 2400, '$0 / month', 'For trying Captify',
+    'free', 'Free', 2400, '$0 / month', 'For trying Sonaris',
     0,
     '[
       {"text": "40 mins daily live transcription", "dim": false},

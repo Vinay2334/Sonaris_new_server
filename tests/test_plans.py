@@ -117,7 +117,7 @@ def test_daily_plan_catalog_orders_four_plans_with_products(monkeypatch):
         },
         {
             "id": "free", "name": "Free", "quota_limit_seconds": 2400,
-            "price_label": "$0 / month", "tagline": "For trying Captify",
+            "price_label": "$0 / month", "tagline": "For trying Sonaris",
             "price_monthly_usd": 0, "features": [], "display_order": 0,
             "is_featured": False,
         },

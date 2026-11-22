@@ -93,7 +93,7 @@ wheels = [
 ]
 
 [[package]]
-name = "captify-server"
+name = "sonaris-server"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

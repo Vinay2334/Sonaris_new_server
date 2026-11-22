@@ -59,7 +59,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
             "(and a JWT secret or JWKS) so every session is authenticated."
         )
     configure_logging(resolved.log_level)
-    app = FastAPI(title="Captify Translation Backend", lifespan=lifespan)
+    app = FastAPI(title="Sonaris Translation Backend", lifespan=lifespan)
     app.state.settings = resolved
     app.state.slot_lock = asyncio.Lock()
     app.state.active_sessions = 0

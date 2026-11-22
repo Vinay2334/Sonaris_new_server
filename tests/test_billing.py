@@ -146,7 +146,7 @@ def test_payment_succeeded_activates_mapped_plan():
             "type": "payment.succeeded",
             "data": {
                 "product_id": "prod_pro",
-                "customer": {"email": "buyer@captify.local"},
+                "customer": {"email": "buyer@sonaris.local"},
                 "metadata": {"user_id": USER_ID},
             },
         },
@@ -154,7 +154,7 @@ def test_payment_succeeded_activates_mapped_plan():
     )
     assert event == BillingEvent(
         action="activate", product_id="prod_pro", plan_id="pro",
-        user_id=USER_ID, email="buyer@captify.local", event_id="evt_1",
+        user_id=USER_ID, email="buyer@sonaris.local", event_id="evt_1",
     )
 
 
@@ -179,7 +179,7 @@ def test_payment_succeeded_reads_product_cart():
             "type": "payment.succeeded",
             "data": {
                 "product_cart": [{"product_id": "prod_studio", "quantity": 1}],
-                "customer": {"email": "buyer@captify.local"},
+                "customer": {"email": "buyer@sonaris.local"},
                 "metadata": {"user_id": USER_ID, "plan_id": "studio"},
             },
         },
@@ -187,7 +187,7 @@ def test_payment_succeeded_reads_product_cart():
     )
     assert event == BillingEvent(
         action="activate", product_id="prod_studio", plan_id="studio",
-        user_id=USER_ID, email="buyer@captify.local", event_id="evt_real",
+        user_id=USER_ID, email="buyer@sonaris.local", event_id="evt_real",
     )
 
 
@@ -291,10 +291,10 @@ def test_webhook_resolves_user_by_email(monkeypatch):
     resp = post_webhook(client, {
         "type": "subscription.active",
         "data": {"product_id": "prod_studio",
-                  "customer": {"email": "buyer@captify.local"}},
+                  "customer": {"email": "buyer@sonaris.local"}},
     })
     assert resp.status_code == 200
-    assert calls["find_email"] == "buyer@captify.local"
+    assert calls["find_email"] == "buyer@sonaris.local"
     assert calls["set_plan"] == (USER_ID, "studio")
 
 
@@ -304,7 +304,7 @@ def test_webhook_unknown_user_ignored(monkeypatch):
     resp = post_webhook(client, {
         "type": "payment.succeeded",
         "data": {"product_id": "prod_pro",
-                  "customer": {"email": "ghost@captify.local"}},
+                  "customer": {"email": "ghost@sonaris.local"}},
     })
     assert resp.status_code == 200
     assert resp.json()["reason"] == "unknown_user"
@@ -317,7 +317,7 @@ def test_webhook_upgrades_product_cart_payment(monkeypatch):
         "id": "evt_cart",
         "type": "payment.succeeded",
         "data": {"product_cart": [{"product_id": "prod_studio", "quantity": 1}],
-                  "customer": {"email": "buyer@captify.local"},
+                  "customer": {"email": "buyer@sonaris.local"},
                   "metadata": {"user_id": USER_ID, "plan_id": "studio"}},
     })
     assert resp.status_code == 200
