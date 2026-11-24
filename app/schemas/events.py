@@ -45,6 +45,13 @@ def normalize_model_tier(value: str | None) -> str | None:
 class AudioAppendEvent(BaseModel):
     type: Literal["audio.append"]
     audio: str = Field(min_length=1)
+    # Mode travelling with the data itself: when present the relay applies
+    # it (sticky) before forwarding this chunk, so audio after a
+    # pause/silence/reconnect never falls back to a default. Absent means
+    # "keep the session's current mode" (set by language-config).
+    mode: SessionMode | None = None
+    target_lang: str | None = None
+    model_tier: ModelTier | None = None
 
 
 class AudioCommitEvent(BaseModel):
@@ -61,6 +68,10 @@ class UpstreamAudioAppendEvent(BaseModel):
 
     type: Literal["input_audio_buffer.append", "session.input_audio_buffer.append"]
     audio: str = Field(min_length=1)
+    # Same per-data mode override as AudioAppendEvent (see above).
+    mode: SessionMode | None = None
+    target_lang: str | None = None
+    model_tier: ModelTier | None = None
 
 
 class UpstreamAudioCommitEvent(BaseModel):

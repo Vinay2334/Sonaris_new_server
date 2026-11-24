@@ -400,6 +400,36 @@ class RelaySession:
         except Exception:
             pass
 
+    def _language_config_from_audio(self, event: Any) -> LanguageConfigEvent | None:
+        """Build a language-config from per-data mode fields, if any.
+
+        Audio events may carry ``mode``/``target_lang``/``model_tier``
+        with every chunk so a fresh session after a pause/reconnect never
+        falls back to a default. Returns None when the chunk carries no
+        mode info (keep the session's current mode). A translation mode
+        without an explicit target falls back to the session's current
+        target so the chunk still routes as translation.
+        """
+        mode = getattr(event, "mode", None)
+        target_lang = getattr(event, "target_lang", None)
+        model_tier = getattr(event, "model_tier", None)
+        if mode is None and model_tier is None and target_lang is None:
+            return None
+        if mode == "translation" and not (target_lang or "").strip():
+            target_lang = (
+                self._subtitle_target_language
+                or self._settings.translation_target_language
+            )
+        try:
+            return LanguageConfigEvent(
+                type="language-config",
+                mode=mode,
+                target_lang=target_lang,
+                model_tier=model_tier,
+            )
+        except ValueError:
+            return None
+
     async def _apply_language_config(
         self, event: LanguageConfigEvent
     ) -> str | None:
@@ -787,6 +817,13 @@ class RelaySession:
                 continue
 
             if isinstance(event, (AudioAppendEvent, UpstreamAudioAppendEvent)):
+                # Mode travelling with the data itself wins for this chunk
+                # (and sticks for following chunks).
+                attached = self._language_config_from_audio(event)
+                if attached is not None:
+                    stop = await self._apply_language_config(attached)
+                    if stop is not None:
+                        return stop
                 try:
                     size = decode_audio_size(event.audio)
                 except ValueError:
