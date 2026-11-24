@@ -639,6 +639,12 @@ class RelaySession:
                 )
             except Exception:
                 pass
+            else:
+                # Streamed pieces bypass the caller's transcript counting
+                # (it sees None below): this output reached the extension,
+                # so it counts toward the session's billed usage.
+                if self._quota is not None:
+                    self._quota.note_transcript()
 
         try:
             translated = await self._subtitle.translate(

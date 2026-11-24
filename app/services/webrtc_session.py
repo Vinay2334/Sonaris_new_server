@@ -607,6 +607,12 @@ class WebRTCRelaySession:
                 )
             except Exception:
                 pass
+            else:
+                # Streamed pieces bypass the caller's transcript counting
+                # (it sees None below): this output reached the extension,
+                # so it counts toward the session's billed usage.
+                if self._quota is not None:
+                    self._quota.note_transcript()
         if source and is_same_language(source, target):
             return mapped
         try:

@@ -14,7 +14,12 @@ path resets a stale period before enforcing).
 
 Safety properties:
 - ``authorize`` runs before a session starts and refuses when no quota
-  remains (``Remaining = limit - used``).
+  remains (``Remaining = limit - used``). Reconnects that reuse a
+  ``client_session_id`` resume the logical session: a row the previous
+  transport already finalized is reopened to ``active`` (its billed
+  total is preserved), and the new tracker is seeded with that total
+  as an offset, so resumed audio bills exactly once on top of it --
+  never dropped, never refunded, never double-billed.
 - ``commit`` is idempotent on ``client_session_id``: reconnects/retries
   that reuse the key can never double-bill, and concurrent sessions are
   serialized (row lock in Postgres, asyncio lock in memory).
@@ -122,8 +127,14 @@ class QuotaStore:
 
     async def authorize(
         self, user_id: str, client_session_id: str, min_start_seconds: int = 1
-    ) -> QuotaSnapshot:
-        """Reserve a session slot. Raises QuotaDenied when not allowed."""
+    ) -> tuple[QuotaSnapshot, int]:
+        """Reserve a session slot. Raises QuotaDenied when not allowed.
+
+        Returns the snapshot plus the seconds already billed under this
+        ``client_session_id`` (0 for a fresh key): a reconnect resumes on
+        top of that total, so the new tracker must seed it as an offset
+        instead of billing from zero.
+        """
         raise NotImplementedError
 
     async def commit(
@@ -206,12 +217,24 @@ class MemoryQuotaStore(QuotaStore):
 
     async def authorize(
         self, user_id: str, client_session_id: str, min_start_seconds: int = 1
-    ) -> QuotaSnapshot:
+    ) -> tuple[QuotaSnapshot, int]:
         async with self._lock:
             existing = self._sessions.get(client_session_id)
-            if existing is not None and existing["status"] == "active":
+            if existing is not None:
+                if existing["status"] in ("completed", "failed"):
+                    # The previous transport finalized this row (pause /
+                    # restart / reconnect race). Reopen it with the billed
+                    # total preserved so the resumed stretch bills on top
+                    # instead of being dropped as already-finalized.
+                    # A finalized row with no quota left stays denied.
+                    snapshot = self._snapshot(existing["user_id"])
+                    if snapshot.remaining_seconds <= 0:
+                        raise QuotaDenied(snapshot)
+                    existing["status"] = "active"
                 # Reconnect reuses the key: resume without double-reserving.
-                return self._snapshot(user_id)
+                # The caller seeds the tracker's offset with the total
+                # billed so far, so only new audio counts from here.
+                return self._snapshot(existing["user_id"]), existing["billed"]
             snapshot = self._snapshot(user_id)
             if snapshot.remaining_seconds < max(min_start_seconds, 1):
                 raise QuotaDenied(snapshot)
@@ -220,7 +243,7 @@ class MemoryQuotaStore(QuotaStore):
                 "status": "active",
                 "billed": 0,
             }
-            return snapshot
+            return snapshot, 0
 
     async def checkpoint(
         self, client_session_id: str, billed_seconds: int
@@ -317,7 +340,7 @@ class SupabaseQuotaStore(QuotaStore):
 
     async def authorize(
         self, user_id: str, client_session_id: str, min_start_seconds: int = 1
-    ) -> QuotaSnapshot:
+    ) -> tuple[QuotaSnapshot, int]:
         data = await self._rpc(
             "authorize_session",
             {"p_user_id": user_id, "p_client_session_id": client_session_id},
@@ -327,7 +350,10 @@ class SupabaseQuotaStore(QuotaStore):
         snapshot = self._snapshot_from_rpc(user_id, data)
         if not data.get("allowed", False):
             raise QuotaDenied(snapshot)
-        return snapshot
+        # The RPC reports the row's billed total on resume (0/absent when
+        # fresh): the tracker seeds it as an offset so resumed audio bills
+        # on top of the preserved total instead of from zero.
+        return snapshot, max(int(data.get("billed_seconds", 0) or 0), 0)
 
     async def checkpoint(
         self, client_session_id: str, billed_seconds: int
@@ -402,6 +428,11 @@ class SessionQuotaTracker:
     snapshot: QuotaSnapshot
     model_tier: str | None = None
     pro_multiplier: float = DEFAULT_PRO_MULTIPLIER
+    # Seconds already billed under this key by a previous transport
+    # (pause / restart / reconnect resume). New audio bills on top of
+    # this offset, so checkpoints and the final commit carry cumulative
+    # totals and the store applies only the new delta.
+    resumed_billed_seconds: int = 0
     audio_bytes: int = 0
     base_audio_bytes: int = 0
     pro_audio_bytes: int = 0
@@ -413,12 +444,19 @@ class SessionQuotaTracker:
     _committed_seconds: int = field(default=0, init=False)
     _last_checkpoint: float = field(default_factory=time.monotonic, init=False)
 
+    def __post_init__(self) -> None:
+        offset = max(int(self.resumed_billed_seconds or 0), 0)
+        self.resumed_billed_seconds = offset
+        # The offset is already in the DB: only audio added after the
+        # resume counts as uncommitted from here.
+        self._committed_seconds = offset
+
     @property
     def billed_seconds(self) -> int:
         weighted = self.base_audio_bytes + self.pro_audio_bytes * max(
             self.pro_multiplier, 0.0
         )
-        return billed_seconds_for_bytes(weighted)
+        return self.resumed_billed_seconds + billed_seconds_for_bytes(weighted)
 
     @property
     def remaining_seconds(self) -> int:
@@ -535,7 +573,15 @@ class SessionQuotaTracker:
         return self.snapshot
 
     async def finish(self, reason: str) -> QuotaSnapshot | None:
-        """Commit usage exactly once. Failed/unprocessed sessions bill 0."""
+        """Commit usage exactly once.
+
+        Failed/unprocessed sessions bill only this tracker's own audio
+        as 0: the commit carries the resumed offset, so usage the
+        previous transport already billed is kept (only this stretch's
+        checkpoints are refunded), never wiped. Upstream failures record
+        ``failed``; a clean end with no output records ``completed`` --
+        both bill the same, and resume reopens either one.
+        """
         if self._finished:
             return None
         self._finished = True
@@ -543,7 +589,7 @@ class SessionQuotaTracker:
             ("upstream_error", "relay_error", "internal_error", "upstream_send_failed")
         )
         if failed or self.transcripts_emitted == 0:
-            billed, status = 0, "failed"
+            billed, status = self.resumed_billed_seconds, "failed" if failed else "completed"
         else:
             billed, status = self.billed_seconds, "completed"
         try:
@@ -586,12 +632,18 @@ async def begin_tracked_session(
 
     ``model_tier`` selects the billing bucket from the first byte
     (``"pro"`` scales by ``pro_multiplier``, anything else bills 1:1).
+    A reused key resumes the logical session: the tracker is seeded
+    with the seconds already billed under it, so only new audio counts.
     """
-    snapshot = await store.authorize(
+    snapshot, resumed_billed = await store.authorize(
         user_id, client_session_id, min_start_seconds=min_start_seconds
     )
     tracker = SessionQuotaTracker(
-        store=store, user_id=user_id, client_session_id=client_session_id, snapshot=snapshot
+        store=store,
+        user_id=user_id,
+        client_session_id=client_session_id,
+        snapshot=snapshot,
+        resumed_billed_seconds=resumed_billed,
     )
     tracker.set_model_tier(model_tier)
     tracker.set_pro_multiplier(pro_multiplier)

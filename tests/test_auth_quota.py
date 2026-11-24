@@ -295,6 +295,94 @@ async def test_retry_same_key_never_double_bills():
 
 
 @pytest.mark.asyncio
+async def test_resume_after_finish_bills_only_new_audio():
+    # Pause/restart: the old transport finalized the row, the reconnect
+    # reuses the key. The resumed stretch bills on top of the preserved
+    # total instead of being dropped (SQL already_finalized) or billing
+    # from zero.
+    store = MemoryQuotaStore()
+    first = await begin_tracked_session(store, USER_ID, "sess-resume")
+    first.add_audio_bytes(48_000)
+    first.note_transcript()
+    await first.finish("closed")
+    assert (await store.get_quota(USER_ID)).used_seconds == 1
+    second = await begin_tracked_session(store, USER_ID, "sess-resume")
+    assert second.resumed_billed_seconds == 1
+    assert second.billed_seconds == 1
+    assert second.uncommitted_seconds == 0
+    second.add_audio_bytes(48_000)
+    second.note_transcript()
+    assert second.billed_seconds == 2
+    final = await second.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 2
+    assert final.remaining_seconds == 2398
+
+
+@pytest.mark.asyncio
+async def test_resume_after_checkpoint_does_not_refund():
+    # Transport dies after a checkpoint without finish running: the row
+    # stays active with billed > 0. Resuming from zero would apply a
+    # negative delta and refund consumed usage; the offset prevents it.
+    store = MemoryQuotaStore()
+    first = await begin_tracked_session(store, USER_ID, "sess-pause")
+    first.add_audio_bytes(96_000)  # 2 s
+    first.note_transcript()
+    await first.checkpoint()
+    assert (await store.get_quota(USER_ID)).used_seconds == 2
+    # No finish: the old tracker is abandoned with the dead transport.
+    second = await begin_tracked_session(store, USER_ID, "sess-pause")
+    assert second.resumed_billed_seconds == 2
+    second.add_audio_bytes(48_000)  # +1 s of resumed audio
+    second.note_transcript()
+    final = await second.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 3
+    assert final.remaining_seconds == 2397
+
+
+@pytest.mark.asyncio
+async def test_resumed_silent_stretch_keeps_prior_usage():
+    # A resumed stretch with no transcripts bills 0 for itself but must
+    # not wipe what the previous transport already billed.
+    store = MemoryQuotaStore()
+    first = await begin_tracked_session(store, USER_ID, "sess-quiet")
+    first.add_audio_bytes(96_000)
+    first.note_transcript()
+    await first.finish("closed")
+    assert (await store.get_quota(USER_ID)).used_seconds == 2
+    second = await begin_tracked_session(store, USER_ID, "sess-quiet")
+    second.add_audio_bytes(48_000)  # silence / upstream failure: no output
+    final = await second.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 2
+
+
+@pytest.mark.asyncio
+async def test_authorize_reopens_finalized_session_row():
+    # The resumed transport finds the row finalized and reopens it to
+    # active with the billed total preserved.
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, USER_ID, "sess-reopen")
+    tracker.add_audio_bytes(48_000)
+    tracker.note_transcript()
+    await tracker.finish("closed")
+    assert store._sessions["sess-reopen"]["status"] == "completed"
+    resumed = await begin_tracked_session(store, USER_ID, "sess-reopen")
+    assert store._sessions["sess-reopen"]["status"] == "active"
+    assert resumed.resumed_billed_seconds == 1
+    # A finalized row with no quota left stays denied, not reopened.
+    store.set_plan(USER_ID, "Free", 2)
+    blocked = await begin_tracked_session(store, USER_ID, "sess-other")
+    blocked.add_audio_bytes(48_000)
+    blocked.note_transcript()
+    await blocked.finish("closed")
+    with pytest.raises(QuotaDenied):
+        await begin_tracked_session(store, USER_ID, "sess-other")
+    assert store._sessions["sess-other"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_sessions_bill_exactly_once_each():
     store = MemoryQuotaStore()
     trackers = await asyncio.gather(
@@ -568,7 +656,7 @@ def test_websocket_tracked_session_bills_audio_seconds():
 
 def test_websocket_tiered_billing_end_to_end():
     # One session, two engines: base audio bills 1:1, audio after a
-    # mid-session switch to pro bills QUOTA_PRO_MULTIPLIER (3x). A single
+    # mid-session switch to pro bills QUOTA_PRO_MULTIPLIER. A single
     # connection covers both stretches because the test harness only
     # supports one full relay session per process (a second
     # websocket_connect fails at the portal with CancelledError).
@@ -613,7 +701,7 @@ def test_websocket_tiered_billing_end_to_end():
             }
         )
         assert next_of("transcript.delta")["delta"] == "hello"
-        # Switch to pro mid-session: later audio bills 3x.
+        # Switch to pro mid-session: later audio bills QUOTA_PRO_MULTIPLIER.
         ws.send_text(
             json.dumps(
                 {
@@ -625,7 +713,7 @@ def test_websocket_tiered_billing_end_to_end():
         )
         swapped = next_of("session.ready", "error")
         assert swapped["type"] == "session.ready", swapped
-        # Pro stretch: 1 s of audio bills 3 quota seconds.
+        # Pro stretch: 1 s of audio bills QUOTA_PRO_MULTIPLIER quota seconds.
         ws.send_text(json.dumps({"type": "audio.append", "audio": "AQID" * 16000}))
         assert wait_for(lambda: len(fakes) > 1 and len(fakes[1].sent) >= 1)
         fakes[1].inject(
@@ -641,9 +729,12 @@ def test_websocket_tiered_billing_end_to_end():
     used = _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
         store.get_quota(USER_ID)
     )
-    # 1 s base + 1 s pro bills 1 + 3 = 4 quota seconds.
-    assert used.used_seconds == 4
-    assert used.remaining_seconds == 2396
+    # 1 s base + 1 s pro bills 1 + QUOTA_PRO_MULTIPLIER quota seconds
+    # (whatever the deployment configured: 3x by default).
+    mult = app.state.settings.quota_pro_multiplier
+    expected = 1 + int(mult)
+    assert used.used_seconds == expected
+    assert used.remaining_seconds == 2400 - expected
 
 
 def test_webrtc_offer_auth_checked_before_api_key_config():

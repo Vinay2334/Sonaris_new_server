@@ -368,3 +368,66 @@ async def test_relay_tasks_cancelled_on_disconnect():
         await task
     # run() shields nothing: cancellation propagates after cleanup.
     assert client.closed is not None or upstream.closed
+
+
+@pytest.mark.asyncio
+async def test_streamed_translation_output_counts_toward_quota():
+    # Regression: with subtitle translation streaming (the normal
+    # DeepSeek/Google path) _maybe_translate_subtitle returns None, so
+    # the relay's transcript counting never fired, finish() billed 0,
+    # and the final commit refunded the checkpoints -- quota "reset to
+    # start" after every translation session.
+    from app.schemas.events import TranscriptDeltaEvent
+    from app.services.quota import MemoryQuotaStore, begin_tracked_session
+
+    class StreamingSubtitle:
+        enabled = True
+
+        def clear_history(self):
+            pass
+
+        async def translate(
+            self,
+            text,
+            *,
+            target_language,
+            source_language=None,
+            store=True,
+            item_id="",
+            on_chunk=None,
+        ):
+            if on_chunk is not None:
+                await on_chunk("namaste translated")
+            return "namaste translated"
+
+    settings = make_settings(
+        TRANSCRIBE_MODE=True,
+        OPENAI_TRANSLATION_SOURCE_LANGUAGE="hi",
+        QUOTA_PRO_MULTIPLIER="2.0",
+    )
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(
+        store, "user-1", "sess-streamed", model_tier="pro", pro_multiplier=2.0
+    )
+    tracker.add_audio_bytes(48_000)  # 1 s of pro audio -> 2 quota seconds
+    client = FakeClient()
+    relay = RelaySession(
+        client,
+        FakeUpstream(),
+        settings,
+        subtitle=StreamingSubtitle(),
+        quota=tracker,
+        model_tier="pro",
+    )
+    assert relay._transcription_mode
+    out = await relay._maybe_translate_subtitle(
+        TranscriptDeltaEvent(delta="hello", item_id="1")
+    )
+    # Streamed path: the piece went straight to the client...
+    assert out is None
+    assert len(client.sent) == 1
+    # ...but the output still counts, so finish bills the audio.
+    assert tracker.transcripts_emitted >= 1
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 2

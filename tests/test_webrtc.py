@@ -379,3 +379,62 @@ def test_offer_validation_rejects_empty_sdp():
         json={"sdp": "", "type": "offer"},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_streamed_translation_output_counts_toward_quota():
+    # Same regression as the WebSocket relay: streamed subtitle pieces
+    # return None from _maybe_translate_subtitle, which used to skip
+    # transcript counting, so finish() billed 0 and refunded the
+    # checkpoints on every translation session.
+    from app.schemas.events import TranscriptDeltaEvent
+    from app.services.quota import MemoryQuotaStore, begin_tracked_session
+
+    class StreamingSubtitle:
+        enabled = True
+
+        def clear_history(self):
+            pass
+
+        async def translate(
+            self,
+            text,
+            *,
+            target_language,
+            source_language=None,
+            store=True,
+            item_id="",
+            on_chunk=None,
+        ):
+            if on_chunk is not None:
+                await on_chunk("namaste translated")
+            return "namaste translated"
+
+    settings = make_settings(
+        TRANSCRIBE_MODE=True,
+        OPENAI_TRANSLATION_SOURCE_LANGUAGE="hi",
+    )
+    store = MemoryQuotaStore()
+    tracker = await begin_tracked_session(store, "user-1", "sess-rtc-stream")
+    tracker.add_audio_bytes(48_000)  # 1 s of base audio -> 1 quota second
+    channel = FakeChannel()
+    relay = WebRTCRelaySession(
+        channel,
+        FakeUpstream(),
+        settings,
+        subtitle=StreamingSubtitle(),
+        quota=tracker,
+        model_tier="base",
+    )
+    assert relay._transcription_mode
+    out = await relay._maybe_translate_subtitle(
+        TranscriptDeltaEvent(delta="hello", item_id="1")
+    )
+    # Streamed path: the piece went straight to the channel...
+    assert out is None
+    assert len(channel.sent) == 1
+    # ...but the output still counts, so finish bills the audio.
+    assert tracker.transcripts_emitted >= 1
+    final = await tracker.finish("closed")
+    assert final is not None
+    assert final.used_seconds == 1
