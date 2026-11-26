@@ -9,8 +9,16 @@ endpoint needs except the FastAPI shell:
   check over the raw body, stdlib only — no new dependency.
 - ``parse_dodo_event``: normalize Dodo's envelope into one BillingEvent
   (activate / deactivate / ignore) that only ever names a plan.
-- ``find_user_id_by_email`` / ``set_user_plan``: service_role Supabase
-  REST calls (the only writer of plan/quota, per the migration's RLS).
+- ``find_user_id_by_email`` / ``set_user_plan`` /
+  ``upsert_subscription_linkage``: service_role Supabase REST calls (the
+  only writer of plan/quota, per the migration's RLS).
+- Paid access is time-boxed by ``billing_subscriptions.current_period_end``
+  (Dodo's ``next_billing_date``): every activate upserts it, a
+  cancel-at-period-end only refreshes it, and the quota RPCs lazily
+  downgrade past-due rows to ``free`` — so ``cancelled`` vs ``expired``
+  needs no branching beyond "keep the date or clear it". Provider ids
+  live in that table (not ``profiles``) so a future provider switch only
+  writes a new ``provider`` value.
 
 Idempotency is structural: applying the same event twice writes the same
 ``plan_id``, so Dodo retries can never double-apply. Unknown event types
@@ -72,6 +80,13 @@ class BillingEvent:
     user_id: str | None = None
     email: str | None = None
     event_id: str | None = None
+    # Paid-period bounds (Dodo subscription payloads only; None when the
+    # event carries no subscription object). ``cancel_at_next_billing_date``
+    # marks a cancel that keeps paid access until ``next_billing_date``.
+    next_billing_date: str | None = None
+    cancel_at_next_billing_date: bool = False
+    subscription_id: str | None = None
+    customer_id: str | None = None
 
 
 def _webhook_key(secret: str) -> bytes:
@@ -176,6 +191,32 @@ def _first_cart_product(data: object) -> str | None:
     return None
 
 
+def _dig_bool(data: object, *paths: str) -> bool:
+    """Fetch the first present dotted path that holds a real boolean."""
+    if not isinstance(data, dict):
+        return False
+    for path in paths:
+        node: object = data
+        for part in path.split("."):
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+        if isinstance(node, bool):
+            return node
+    return False
+
+
+def _customer_id(data: dict) -> str | None:
+    """Dodo customer id: dict (``customer_id``) or a bare id string."""
+    customer = data.get("customer")
+    if isinstance(customer, dict):
+        return _first_str(customer.get("customer_id"), customer.get("id"))
+    if isinstance(customer, str) and customer.strip():
+        return customer.strip()
+    return _first_str(data.get("customer_id"))
+
+
 def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
     """Normalize a Dodo webhook envelope into an actionable event.
 
@@ -215,6 +256,24 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
             "payment.customer.email",
         ),
         event_id=event_id,
+        next_billing_date=_dig(
+            data,
+            "next_billing_date",
+            "subscription.next_billing_date",
+            "payment.next_billing_date",
+        ),
+        cancel_at_next_billing_date=_dig_bool(
+            data,
+            "cancel_at_next_billing_date",
+            "subscription.cancel_at_next_billing_date",
+        ),
+        subscription_id=_dig(
+            data,
+            "subscription_id",
+            "subscription.subscription_id",
+            "payment.subscription_id",
+        ),
+        customer_id=_customer_id(data),
     )
 
     if event_type in DEACTIVATE_EVENTS:
@@ -224,6 +283,10 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
             user_id=event.user_id,
             email=event.email,
             event_id=event.event_id,
+            next_billing_date=event.next_billing_date,
+            cancel_at_next_billing_date=event.cancel_at_next_billing_date,
+            subscription_id=event.subscription_id,
+            customer_id=event.customer_id,
         )
     if event_type in ACTIVATE_EVENTS:
         plan_id = plan_map.get(event.product_id or "")
@@ -247,6 +310,10 @@ def parse_dodo_event(payload: dict, plan_map: dict[str, str]) -> BillingEvent:
             user_id=event.user_id,
             email=event.email,
             event_id=event.event_id,
+            next_billing_date=event.next_billing_date,
+            cancel_at_next_billing_date=event.cancel_at_next_billing_date,
+            subscription_id=event.subscription_id,
+            customer_id=event.customer_id,
         )
     return event
 
@@ -317,16 +384,10 @@ async def find_user_id_by_email(
             await http.aclose()
 
 
-async def set_user_plan(
-    user_id: str, plan_id: str, settings: Settings, *, client=None
+async def _patch_profile(
+    user_id: str, payload: dict, settings: Settings, *, client=None
 ) -> bool:
-    """Move a profile to ``plan_id`` (service_role bypasses RLS by design).
-
-    Returns True on success. A missing ``plans`` row fails closed (False)
-    via the foreign key instead of inventing a plan.
-    """
-    from datetime import datetime, timezone
-
+    """PATCH one profile row (service_role bypasses RLS by design)."""
     base = settings.supabase_url.rstrip("/")
     headers = _supabase_headers(settings)
     owned = client is not None
@@ -337,32 +398,271 @@ async def set_user_plan(
         if owned:
             response = await http.patch(
                 f"{base}/rest/v1/profiles?user_id=eq.{user_id}",
-                json={
-                    "plan_id": plan_id,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
+                json=payload,
                 headers=headers,
             )
         else:
             response = await http.patch(
                 f"/rest/v1/profiles?user_id=eq.{user_id}",
-                json={
-                    "plan_id": plan_id,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
+                json=payload,
             )
         if response.status_code >= 400:
             log.warning(
-                "dodo plan update failed user=%s plan=%s status=%s",
+                "dodo profile update failed user=%s status=%s",
                 user_id,
-                plan_id,
                 response.status_code,
             )
             return False
         return True
     except httpx.HTTPError as exc:
-        log.warning("dodo plan update transport failed type=%s", type(exc).__name__)
+        log.warning(
+            "dodo profile update transport failed type=%s",
+            type(exc).__name__,
+        )
         return False
+    finally:
+        if not owned:
+            await http.aclose()
+
+
+async def set_user_plan(
+    user_id: str, plan_id: str, settings: Settings, *, client=None
+) -> bool:
+    """Move a profile to ``plan_id`` (service_role bypasses RLS by design).
+
+    Plan only: the paid period lives in ``billing_subscriptions`` (see
+    ``upsert_subscription_linkage``). Returns True on success. A missing
+    ``plans`` row fails closed (False) via the foreign key instead of
+    inventing a plan.
+    """
+    from datetime import datetime, timezone
+
+    ok = await _patch_profile(
+        user_id,
+        {
+            "plan_id": plan_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        settings,
+        client=client,
+    )
+    if not ok:
+        log.warning(
+            "dodo plan update failed user=%s plan=%s", user_id, plan_id
+        )
+    return ok
+
+
+# Sentinel: "leave the stored period end untouched" (vs None = clear it).
+_KEEP_PERIOD_END: object = object()
+
+
+async def upsert_subscription_linkage(
+    user_id: str,
+    settings: Settings,
+    *,
+    client=None,
+    provider: str = "dodo",
+    current_period_end: str | None | object = _KEEP_PERIOD_END,
+    subscription_id: str | None = None,
+    customer_id: str | None = None,
+) -> bool:
+    """Upsert the user's row in ``billing_subscriptions`` (keyed on user).
+
+    Only provided fields are written (PostgREST merge-duplicates):
+    ``current_period_end`` left at the default leaves the stored date
+    untouched, an explicit ``None`` clears it (immediate downgrade keeps
+    the ids for the portal button). ``provider`` scopes the row so a
+    future provider switch writes a new value instead of touching
+    ``profiles``. Returns True on success.
+    """
+    from datetime import datetime, timezone
+
+    base = settings.supabase_url.rstrip("/")
+    headers = {
+        **_supabase_headers(settings),
+        "Prefer": "resolution=merge-duplicates",
+    }
+    row: dict = {
+        "user_id": user_id,
+        "provider": provider,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if current_period_end is not _KEEP_PERIOD_END:
+        row["current_period_end"] = current_period_end
+    if subscription_id is not None:
+        row["provider_subscription_id"] = subscription_id
+    if customer_id is not None:
+        row["provider_customer_id"] = customer_id
+    owned = client is not None
+    http = client or httpx.AsyncClient(
+        base_url=base, headers=headers, timeout=10.0
+    )
+    try:
+        if owned:
+            response = await http.post(
+                f"{base}/rest/v1/billing_subscriptions?on_conflict=user_id",
+                json=row,
+                headers=headers,
+            )
+        else:
+            response = await http.post(
+                "/rest/v1/billing_subscriptions",
+                params={"on_conflict": "user_id"},
+                json=row,
+            )
+        if response.status_code >= 400:
+            log.warning(
+                "dodo linkage upsert failed user=%s status=%s",
+                user_id,
+                response.status_code,
+            )
+            return False
+        return True
+    except httpx.HTTPError as exc:
+        log.warning(
+            "dodo linkage upsert transport failed type=%s",
+            type(exc).__name__,
+        )
+        return False
+    finally:
+        if not owned:
+            await http.aclose()
+
+
+@dataclass(frozen=True)
+class SubscriptionLinkage:
+    """One user's row in ``billing_subscriptions`` (provider-agnostic)."""
+
+    provider: str
+    provider_customer_id: str | None = None
+    provider_subscription_id: str | None = None
+    current_period_end: str | None = None
+
+
+_LINKAGE_COLUMNS = (
+    "provider,provider_customer_id,"
+    "provider_subscription_id,current_period_end"
+)
+
+
+async def get_subscription_linkage(
+    user_id: str, settings: Settings, *, client=None
+) -> SubscriptionLinkage | None:
+    """Read the user's billing linkage row (None when never subscribed).
+
+    Raises RuntimeError when Supabase cannot be reached: the portal
+    endpoint maps that to a retryable 502 instead of "no subscription".
+    ``client`` is a test seam (see ``find_user_id_by_email``).
+    """
+    base = settings.supabase_url.rstrip("/")
+    headers = _supabase_headers(settings)
+    owned = client is not None
+    http = client or httpx.AsyncClient(
+        base_url=base, headers=headers, timeout=10.0
+    )
+    try:
+        if owned:
+            response = await http.get(
+                f"{base}/rest/v1/billing_subscriptions",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": _LINKAGE_COLUMNS,
+                },
+                headers=headers,
+            )
+        else:
+            response = await http.get(
+                "/rest/v1/billing_subscriptions",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": _LINKAGE_COLUMNS,
+                },
+            )
+        if response.status_code >= 400:
+            log.warning(
+                "dodo linkage read failed status=%s", response.status_code
+            )
+            raise RuntimeError("linkage lookup failed")
+        try:
+            rows = response.json()
+        except ValueError:
+            raise RuntimeError("linkage lookup failed")
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[0] if isinstance(rows[0], dict) else {}
+        return SubscriptionLinkage(
+            provider=str(row.get("provider") or ""),
+            provider_customer_id=_first_str(row.get("provider_customer_id")),
+            provider_subscription_id=_first_str(
+                row.get("provider_subscription_id")
+            ),
+            current_period_end=_first_str(row.get("current_period_end")),
+        )
+    except httpx.HTTPError as exc:
+        log.warning(
+            "dodo linkage read transport failed type=%s", type(exc).__name__
+        )
+        raise RuntimeError("linkage lookup failed")
+    finally:
+        if not owned:
+            await http.aclose()
+
+
+async def create_portal_session(
+    customer_id: str,
+    settings: Settings,
+    *,
+    client=None,
+    return_url: str | None = None,
+) -> str | None:
+    """Mint a Dodo customer-portal sign-in link (valid 24 hours).
+
+    Returns the ``link`` to redirect the user to, or None when Dodo
+    cannot be reached or rejects the request. The link itself is never
+    logged: it signs the customer in. ``client`` is a test seam.
+    """
+    from urllib.parse import urlencode
+
+    base = settings.dodo_api_base.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {settings.dodo_api_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    owned = client is not None
+    http = client or httpx.AsyncClient(
+        base_url=base, headers=headers, timeout=10.0
+    )
+    try:
+        if owned:
+            url = f"{base}/customers/{customer_id}/customer-portal/session"
+            if return_url:
+                url += "?" + urlencode({"return_url": return_url})
+            response = await http.post(url, headers=headers)
+        else:
+            response = await http.post(
+                f"/customers/{customer_id}/customer-portal/session",
+                params={"return_url": return_url} if return_url else None,
+            )
+        if response.status_code >= 400:
+            log.warning(
+                "dodo portal session failed status=%s", response.status_code
+            )
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        link = body.get("link") if isinstance(body, dict) else None
+        if isinstance(link, str) and link.strip():
+            return link.strip()
+        log.warning("dodo portal session missing link")
+        return None
+    except httpx.HTTPError as exc:
+        log.warning(
+            "dodo portal session transport failed type=%s", type(exc).__name__
+        )
+        return None
     finally:
         if not owned:
             await http.aclose()

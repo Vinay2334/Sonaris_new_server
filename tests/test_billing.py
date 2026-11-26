@@ -3,7 +3,12 @@
 Covers the billing contract with fakes for the Supabase REST calls:
 - Standard Webhooks signature check (valid / wrong secret / tampered /
   stale / missing headers / whsec_ prefix).
-- Event normalization (activate / deactivate / ignore).
+- Event normalization (activate / deactivate / ignore), including the
+  paid-period fields (`next_billing_date`, `cancel_at_next_billing_date`,
+  subscription/customer ids).
+- Cancel semantics: cancel-at-period-end only records the period
+  (`cancel_scheduled`, plan untouched); an immediate cancel clears the
+  period and drops to free.
 - Endpoint status contract: 401 bad signature, 503 billing disabled,
   200 applied-or-ignored, 502 transient Supabase failure.
 - Plan changes apply to the metadata user id, or to the email-resolved
@@ -25,6 +30,8 @@ from app.main import create_app
 from app.services.billing import (
     BillingEvent,
     parse_dodo_event,
+    set_user_plan,
+    upsert_subscription_linkage,
     verify_dodo_signature,
 )
 
@@ -243,11 +250,18 @@ def make_client(monkeypatch, **overrides):
         calls["set_plan"] = (user_id, plan_id)
         return calls.get("plan_ok", True)
 
+    async def fake_upsert(user_id, _settings, **kwargs):
+        calls["upsert"] = (user_id, kwargs)
+        return calls.get("plan_ok", True)
+
     async def fake_find(email, _settings, **kwargs):
         calls["find_email"] = email
         return calls.get("found_user")
 
     monkeypatch.setattr(billing_api, "set_user_plan", fake_set_plan)
+    monkeypatch.setattr(
+        billing_api, "upsert_subscription_linkage", fake_upsert
+    )
     monkeypatch.setattr(billing_api, "find_user_id_by_email", fake_find)
     return TestClient(app), calls
 
@@ -283,6 +297,10 @@ def test_webhook_cancellation_downgrades_to_free(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["action"] == "deactivate"
     assert calls["set_plan"] == (USER_ID, "free")
+    # Immediate downgrade clears the period end but keeps the ids.
+    user_id, kwargs = calls["upsert"]
+    assert user_id == USER_ID
+    assert kwargs.get("current_period_end") is None
 
 
 def test_webhook_resolves_user_by_email(monkeypatch):
@@ -363,3 +381,224 @@ def test_webhook_disabled_without_secret(monkeypatch):
     client, _ = make_client(monkeypatch, DODO_WEBHOOK_SECRET="")
     resp = post_webhook(client, {"type": "payment.succeeded", "data": {}})
     assert resp.status_code == 503
+
+
+# --- paid-period extraction --------------------------------------------------
+
+
+def test_subscription_active_extracts_period():
+    event = parse_dodo_event(
+        {
+            "id": "evt_period",
+            "type": "subscription.active",
+            "data": {
+                "product_id": "prod_pro",
+                "subscription_id": "sub_123",
+                "customer": {"customer_id": "cus_456",
+                             "email": "buyer@sonaris.local"},
+                "next_billing_date": "2026-12-26T00:00:00Z",
+                "cancel_at_next_billing_date": False,
+                "metadata": {"user_id": USER_ID},
+            },
+        },
+        PLAN_MAP,
+    )
+    assert event == BillingEvent(
+        action="activate", product_id="prod_pro", plan_id="pro",
+        user_id=USER_ID, email="buyer@sonaris.local", event_id="evt_period",
+        next_billing_date="2026-12-26T00:00:00Z",
+        cancel_at_next_billing_date=False,
+        subscription_id="sub_123", customer_id="cus_456",
+    )
+
+
+def test_cancelled_at_period_end_marks_scheduled():
+    event = parse_dodo_event(
+        {
+            "type": "subscription.cancelled",
+            "data": {
+                "subscription_id": "sub_123",
+                "customer": {"customer_id": "cus_456"},
+                "cancel_at_next_billing_date": True,
+                "next_billing_date": "2026-12-26T00:00:00Z",
+                "metadata": {"user_id": USER_ID},
+            },
+        },
+        PLAN_MAP,
+    )
+    assert event.action == "deactivate"
+    assert event.cancel_at_next_billing_date is True
+    assert event.next_billing_date == "2026-12-26T00:00:00Z"
+    assert event.subscription_id == "sub_123"
+    assert event.customer_id == "cus_456"
+
+
+def test_string_customer_id_accepted():
+    event = parse_dodo_event(
+        {
+            "type": "subscription.renewed",
+            "data": {
+                "product_id": "prod_studio",
+                "subscription_id": "sub_9",
+                "customer": "cus_bare",
+                "next_billing_date": "2026-12-26T00:00:00Z",
+            },
+        },
+        PLAN_MAP,
+    )
+    assert event.action == "activate"
+    assert event.customer_id == "cus_bare"
+
+
+# --- scheduled vs immediate cancel (endpoint) --------------------------------
+
+
+def test_webhook_scheduled_cancel_keeps_plan(monkeypatch):
+    client, calls = make_client(monkeypatch)
+    resp = post_webhook(client, {
+        "type": "subscription.cancelled",
+        "data": {
+                    "subscription_id": "sub_123",
+                    "customer": {"customer_id": "cus_456"},
+                    "cancel_at_next_billing_date": True,
+                    "next_billing_date": "2026-12-26T00:00:00Z",
+                    "metadata": {"user_id": USER_ID}},
+    })
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True, "action": "cancel_scheduled",
+        "current_period_end": "2026-12-26T00:00:00Z",
+    }
+    assert "set_plan" not in calls
+    user_id, kwargs = calls["upsert"]
+    assert user_id == USER_ID
+    assert kwargs.get("current_period_end") == "2026-12-26T00:00:00Z"
+    assert kwargs.get("subscription_id") == "sub_123"
+    assert kwargs.get("customer_id") == "cus_456"
+
+
+def test_webhook_scheduled_cancel_without_date_downgrades(monkeypatch):
+    # Flag but no date: nothing to schedule against, so downgrade now.
+    client, calls = make_client(monkeypatch)
+    resp = post_webhook(client, {
+        "type": "subscription.cancelled",
+        "data": {"cancel_at_next_billing_date": True,
+                  "metadata": {"user_id": USER_ID}},
+    })
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "deactivate"
+    assert calls["set_plan"] == (USER_ID, "free")
+    user_id, kwargs = calls["upsert"]
+    assert user_id == USER_ID
+    assert kwargs.get("current_period_end") is None
+
+
+def test_webhook_activate_stores_period(monkeypatch):
+    client, calls = make_client(monkeypatch)
+    resp = post_webhook(client, {
+        "id": "evt_store",
+        "type": "subscription.renewed",
+        "data": {"product_id": "prod_pro",
+                  "subscription_id": "sub_123",
+                  "customer": {"customer_id": "cus_456"},
+                  "next_billing_date": "2026-12-26T00:00:00Z",
+                  "metadata": {"user_id": USER_ID}},
+    })
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "action": "activate", "plan_id": "pro"}
+    assert calls["set_plan"] == (USER_ID, "pro")
+    user_id, kwargs = calls["upsert"]
+    assert user_id == USER_ID
+    assert kwargs.get("current_period_end") == "2026-12-26T00:00:00Z"
+    assert kwargs.get("subscription_id") == "sub_123"
+    assert kwargs.get("customer_id") == "cus_456"
+
+
+# --- plan + linkage writer payloads ------------------------------------------
+
+
+class FakeResponse:
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+
+
+class FakeClient:
+    """Injectable httpx stand-in capturing PATCH/POST calls (no network)."""
+
+    def __init__(self, status=200):
+        self.patches = []
+        self.posts = []
+        self._status = status
+
+    async def patch(self, url, json=None, headers=None):
+        self.patches.append({"url": url, "json": json})
+        return FakeResponse(self._status)
+
+    async def post(self, url, json=None, headers=None, params=None):
+        self.posts.append(
+            {"url": url, "json": json, "headers": headers, "params": params}
+        )
+        return FakeResponse(self._status)
+
+
+async def test_set_user_plan_writes_plan_only():
+    settings = make_settings()
+    client = FakeClient()
+    assert await set_user_plan("u1", "pro", settings, client=client)
+    body = client.patches[0]["json"]
+    assert body["plan_id"] == "pro"
+    assert "current_period_end" not in body
+    assert "provider_subscription_id" not in body
+
+
+async def test_linkage_upsert_writes_full_row():
+    settings = make_settings()
+    client = FakeClient()
+    assert await upsert_subscription_linkage(
+        "u1", settings, client=client,
+        current_period_end="2026-12-26T00:00:00Z",
+        subscription_id="sub_1", customer_id="cus_1",
+    )
+    post = client.posts[0]
+    assert post["url"].endswith(
+        "/rest/v1/billing_subscriptions?on_conflict=user_id"
+    )
+    assert post["headers"]["Prefer"] == "resolution=merge-duplicates"
+    body = post["json"]
+    assert body["user_id"] == "u1"
+    assert body["provider"] == "dodo"
+    assert body["current_period_end"] == "2026-12-26T00:00:00Z"
+    assert body["provider_subscription_id"] == "sub_1"
+    assert body["provider_customer_id"] == "cus_1"
+
+
+async def test_linkage_upsert_leaves_period_when_omitted():
+    settings = make_settings()
+    client = FakeClient()
+    assert await upsert_subscription_linkage(
+        "u1", settings, client=client, subscription_id="sub_1"
+    )
+    body = client.posts[0]["json"]
+    assert "current_period_end" not in body
+    assert body["provider_subscription_id"] == "sub_1"
+
+
+async def test_linkage_upsert_clear_period_keeps_ids():
+    settings = make_settings()
+    client = FakeClient()
+    assert await upsert_subscription_linkage(
+        "u1", settings, client=client, current_period_end=None
+    )
+    body = client.posts[0]["json"]
+    assert body["current_period_end"] is None
+    assert "provider_subscription_id" not in body
+    assert "provider_customer_id" not in body
+
+
+async def test_writer_failure_returns_false():
+    settings = make_settings()
+    client = FakeClient(status=500)
+    assert not await set_user_plan("u1", "pro", settings, client=client)
+    assert not await upsert_subscription_linkage(
+        "u1", settings, client=client, current_period_end=None
+    )

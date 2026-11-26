@@ -11,6 +11,11 @@ Status contract (tuned for Dodo's retries):
 - 200 applied or deliberately ignored (unknown type, unmapped product,
   no identifiable user): retrying would not help.
 - 502 Supabase read/write failed — transient, worth a Dodo retry.
+
+Cancel semantics: a cancel with ``cancel_at_next_billing_date`` keeps the
+paid plan and only records the period end (``cancel_scheduled``) — the
+quota RPCs lapse the row to free once the date passes. An immediate
+cancel (or an expiry) clears the period and drops to free at once.
 """
 
 from fastapi import APIRouter, Request
@@ -22,6 +27,7 @@ from app.services.billing import (
     find_user_id_by_email,
     parse_dodo_event,
     set_user_plan,
+    upsert_subscription_linkage,
     verify_dodo_signature,
 )
 
@@ -82,11 +88,6 @@ async def dodo_webhook(request: Request):
             status_code=200, content={"ok": True, "action": "ignored"}
         )
 
-    plan_id = (
-        event.plan_id
-        if event.action == "activate"
-        else settings.dodo_free_plan_id.strip() or "free"
-    )
     try:
         user_id = await _resolve_user_id(settings, event)
     except Exception as exc:  # lookup transport blew up: retryable
@@ -105,8 +106,52 @@ async def dodo_webhook(request: Request):
             content={"ok": True, "action": "ignored",
                      "reason": "unknown_user"},
         )
+    # A cancel at the next billing date keeps the paid plan: only the
+    # linkage row's period end is recorded; the quota RPCs lapse the row
+    # to free once it passes. Anything else applies a plan change
+    # immediately (and clears the period end, keeping the ids).
+    scheduled = (
+        event.action == "deactivate"
+        and event.cancel_at_next_billing_date
+        and event.next_billing_date is not None
+    )
     try:
-        applied = await set_user_plan(user_id, plan_id, settings)
+        if scheduled:
+            applied = await upsert_subscription_linkage(
+                user_id,
+                settings,
+                current_period_end=event.next_billing_date,
+                subscription_id=event.subscription_id,
+                customer_id=event.customer_id,
+            )
+        elif event.action == "activate":
+            if event.next_billing_date is None:
+                log.warning(
+                    "dodo activate without next_billing_date type=%s event=%s",
+                    payload.get("type"),
+                    event.event_id,
+                )
+            applied = await set_user_plan(user_id, event.plan_id, settings)
+            if applied:
+                linkage: dict = {
+                    "subscription_id": event.subscription_id,
+                    "customer_id": event.customer_id,
+                }
+                if event.next_billing_date is not None:
+                    linkage["current_period_end"] = event.next_billing_date
+                applied = await upsert_subscription_linkage(
+                    user_id, settings, **linkage
+                )
+        else:
+            applied = await set_user_plan(
+                user_id,
+                settings.dodo_free_plan_id.strip() or "free",
+                settings,
+            )
+            if applied:
+                applied = await upsert_subscription_linkage(
+                    user_id, settings, current_period_end=None
+                )
     except Exception as exc:
         log.warning("dodo plan apply failed type=%s", type(exc).__name__)
         return JSONResponse(
@@ -116,6 +161,26 @@ async def dodo_webhook(request: Request):
         return JSONResponse(
             status_code=502, content={"ok": False, "reason": "plan_update_failed"}
         )
+    if scheduled:
+        log.info(
+            "dodo webhook applied action=cancel_scheduled user=%s ends_at=%s event=%s",
+            user_id,
+            event.next_billing_date,
+            event.event_id,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "action": "cancel_scheduled",
+                "current_period_end": event.next_billing_date,
+            },
+        )
+    plan_id = (
+        event.plan_id
+        if event.action == "activate"
+        else settings.dodo_free_plan_id.strip() or "free"
+    )
     log.info(
         "dodo webhook applied action=%s user=%s plan=%s event=%s",
         event.action,

@@ -186,6 +186,15 @@ class Settings(BaseSettings):
     dodo_plan_map: str = Field(default="", alias="DODO_PLAN_MAP")
     # Plan assigned when a subscription ends (cancelled / expired).
     dodo_free_plan_id: str = Field(default="free", alias="DODO_FREE_PLAN_ID")
+    # Dodo API key for server-side calls (customer portal sessions).
+    # Backend only, never sent to the extension. Empty disables the
+    # portal endpoint (it answers 503).
+    dodo_api_key: str = Field(default="", alias="DODO_API_KEY")
+    # Dodo API base: https://live.dodopayments.com for production,
+    # https://test.dodopayments.com for test-mode checkouts.
+    dodo_api_base: str = Field(
+        default="https://live.dodopayments.com", alias="DODO_API_BASE"
+    )
 
     # Client-facing WebSocket limits.
     # Comma-separated origins, or "*" to allow any origin (local dev default).
@@ -321,6 +330,14 @@ class Settings(BaseSettings):
     def billing_enabled(self) -> bool:
         """Whether the Dodo webhook endpoint can apply plan changes."""
         return self.quota_enforced() and bool(self.dodo_webhook_secret.strip())
+
+    def portal_available(self) -> bool:
+        """Whether the customer portal endpoint can mint sessions."""
+        return (
+            self.quota_enforced()
+            and bool(self.dodo_api_key.strip())
+            and bool(self.dodo_api_base.strip())
+        )
 
     def dodo_plans(self) -> dict[str, str]:
         """Dodo product id -> plans.id mapping from DODO_PLAN_MAP."""

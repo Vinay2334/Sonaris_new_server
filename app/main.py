@@ -11,6 +11,7 @@ from app.api.webrtc import router as webrtc_router
 from app.api.quota import router as quota_router
 from app.api.billing import router as billing_router
 from app.api.plans import router as plans_router
+from app.api.subscription import router as subscription_router
 from app.core.config import Settings, settings as default_settings
 from app.core.logging import configure_logging, get_logger
 from app.services.quota import build_quota_store
@@ -74,6 +75,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
     app.include_router(quota_router)
     app.include_router(billing_router)
     app.include_router(plans_router)
+    app.include_router(subscription_router)
 
     # Browser access for the static site (pricing page fetches the plan
     # catalog and the signed-in user's quota). Bearer tokens ride the
@@ -83,7 +85,7 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=website_origins,
-            allow_methods=["GET", "OPTIONS"],
+            allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type"],
             max_age=600,
         )
@@ -93,7 +95,6 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         return {
             "status": "ok",
             "active_sessions": app.state.active_sessions,
-            "model": resolved.active_model(),
         }
 
     return app
