@@ -193,7 +193,7 @@ class Settings(BaseSettings):
     # Dodo API base: https://live.dodopayments.com for production,
     # https://test.dodopayments.com for test-mode checkouts.
     dodo_api_base: str = Field(
-        default="https://live.dodopayments.com", alias="DODO_API_BASE"
+        default="https://test.dodopayments.com/", alias="DODO_API_BASE"
     )
 
     # Client-facing WebSocket limits.
